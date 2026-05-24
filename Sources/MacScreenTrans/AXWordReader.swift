@@ -99,14 +99,6 @@ enum AXWordReader {
         let screen = NSScreen.screens.first { NSMouseInRect(appKitPoint, $0.frame, false) } ?? NSScreen.main
         guard let screen else { return appKitPoint }
 
-        if let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber {
-            let displayBounds = CGDisplayBounds(CGDirectDisplayID(number.uint32Value))
-            return CGPoint(
-                x: displayBounds.minX + (appKitPoint.x - screen.frame.minX),
-                y: displayBounds.maxY - (appKitPoint.y - screen.frame.minY)
-            )
-        }
-
         return CGPoint(
             x: appKitPoint.x,
             y: screen.frame.maxY - appKitPoint.y + screen.frame.minY

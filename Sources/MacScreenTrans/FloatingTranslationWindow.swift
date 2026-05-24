@@ -78,6 +78,19 @@ final class FloatingTranslationWindowController {
         targetTextView.font = .systemFont(ofSize: 15)
         targetTextView.textContainerInset = NSSize(width: 12, height: 10)
         targetTextView.textContainer?.lineFragmentPadding = 0
+        targetTextView.minSize = .zero
+        targetTextView.maxSize = NSSize(
+            width: CGFloat.greatestFiniteMagnitude,
+            height: CGFloat.greatestFiniteMagnitude
+        )
+        targetTextView.isVerticallyResizable = true
+        targetTextView.isHorizontallyResizable = false
+        targetTextView.autoresizingMask = [.width]
+        targetTextView.textContainer?.widthTracksTextView = true
+        targetTextView.textContainer?.containerSize = NSSize(
+            width: 0,
+            height: CGFloat.greatestFiniteMagnitude
+        )
         targetTextView.string = ""
         scrollView.documentView = targetTextView
 
@@ -273,14 +286,30 @@ private struct ParsedPopupText {
 
     init(_ rawText: String) {
         let text = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
-        if text.hasPrefix("意群:"),
-           let targetRange = text.range(of: "\n释义:") {
-            let parsedTarget = text[targetRange.upperBound...]
+        let sourcePrefix = "意群:"
+        let targetPrefix = "\n释义:"
+
+        if text.hasPrefix(sourcePrefix) {
+            let afterSourcePrefix = text.index(text.startIndex, offsetBy: sourcePrefix.count)
+
+            if let targetRange = text.range(of: targetPrefix) {
+                let parsedTarget = text[targetRange.upperBound...]
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                status = parsedTarget.isEmpty || parsedTarget.hasPrefix("正在") ? "翻译中" : "翻译完成"
+                source = text[afterSourcePrefix..<targetRange.lowerBound]
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                target = parsedTarget.isEmpty ? "正在补译..." : parsedTarget
+                return
+            }
+
+            // Streaming may emit "意群: X" before the next chunk adds "\n释义: Y".
+            // Don't drop into the catch-all path (which hides the source field and
+            // dumps the whole line into the translation slot); keep the source
+            // visible and show a placeholder until the target arrives.
+            status = "翻译中"
+            source = text[afterSourcePrefix...]
                 .trimmingCharacters(in: .whitespacesAndNewlines)
-            status = parsedTarget.isEmpty || parsedTarget.hasPrefix("正在") ? "翻译中" : "翻译完成"
-            source = text[text.index(text.startIndex, offsetBy: 3)..<targetRange.lowerBound]
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            target = parsedTarget.isEmpty ? "正在补译..." : parsedTarget
+            target = "正在补译..."
             return
         }
 

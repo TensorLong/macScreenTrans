@@ -21,7 +21,18 @@ public enum OpenAIStreamingError: LocalizedError {
 }
 
 public final class OpenAIStreamingClient: Sendable {
-    public init() {}
+    private let session: URLSession
+
+    public convenience init() {
+        let configuration = URLSessionConfiguration.default
+        configuration.timeoutIntervalForRequest = 20
+        configuration.timeoutIntervalForResource = 60
+        self.init(session: URLSession(configuration: configuration))
+    }
+
+    init(session: URLSession) {
+        self.session = session
+    }
 
     public func streamExplanation(
         selection: WordSelection,
@@ -62,17 +73,20 @@ public final class OpenAIStreamingClient: Sendable {
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
+        request.timeoutInterval = 20
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("Bearer \(config.apiKey)", forHTTPHeaderField: "Authorization")
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
-        let (bytes, response) = try await URLSession.shared.bytes(for: request)
+        let (bytes, response) = try await session.bytes(for: request)
         guard let http = response as? HTTPURLResponse else {
             throw OpenAIStreamingError.invalidHTTPResponse
         }
         guard 200..<300 ~= http.statusCode else {
-            let body = try await bytes.reduce(into: Data()) { partial, byte in
-                partial.append(byte)
+            var body = Data()
+            for try await byte in bytes {
+                guard body.count < 4096 else { break }
+                body.append(byte)
             }
             let text = String(data: body, encoding: .utf8) ?? "<no body>"
             throw OpenAIStreamingError.httpFailure(http.statusCode, text)

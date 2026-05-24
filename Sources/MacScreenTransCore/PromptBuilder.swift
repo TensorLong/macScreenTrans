@@ -50,6 +50,9 @@ public enum PromptBuilder {
     5. For verbs, include the object/complement (e.g. "make a decision", not "make").
     6. For nouns, include tight modifiers/articles (e.g. "an ironic twist", not "twist").
     7. target_chunk MUST translate ONLY source_chunk, not the surrounding sentence.
+    8. Never copy rule text such as "exact substring of the sentence" unless it
+       literally appears in the user's sentence.
+    9. target_chunk must be non-empty and written in {target_language}.
 
     Output schema (return this exact JSON object and nothing else):
     {"source_chunk":"...","target_chunk":"..."}

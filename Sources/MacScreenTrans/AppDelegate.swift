@@ -52,14 +52,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func configureStatusItem() {
-        statusItem = NSStatusBar.system.statusItem(withLength: 92)
-        statusItem?.button?.image = StatusBarIcon.makeBadge()
-        statusItem?.button?.title = " 译 Trans"
-        statusItem?.button?.imagePosition = .imageLeft
-        statusItem?.button?.font = .systemFont(ofSize: 13, weight: .semibold)
-        statusItem?.button?.toolTip = "MacScreenTrans - 点击打开设置和翻译菜单"
-        statusItem?.button?.setAccessibilityLabel("MacScreenTrans menu bar item")
-        statusItem?.button?.setAccessibilityHelp("菜单栏应显示为蓝色译图标和 Trans 文字")
+        // Hidden Bar / Bartender-style utilities persist NSStatusItem positions
+        // under autosaveName; once the icon is pushed into the collapsed zone it
+        // stays there. Skip autosave so the OS positions the item afresh each
+        // launch, and rely on MenuBarBadgeWindowController as a visible fallback.
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        if let button = item.button {
+            button.title = "译"
+            button.image = nil
+            button.imagePosition = .noImage
+            button.font = .systemFont(ofSize: 15, weight: .semibold)
+            button.toolTip = "MacScreenTrans"
+            button.setAccessibilityLabel("MacScreenTrans 菜单栏图标")
+            button.setAccessibilityHelp("点击打开设置和翻译菜单")
+        }
+        statusItem = item
         statusMenu.delegate = self
         rebuildStatusMenu()
         statusItem?.menu = statusMenu
@@ -177,30 +184,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     await MainActor.run {
                         popup.update("模型没有返回内容。")
                     }
-                } else if let response = SenseGroupResponseRenderer.response(for: output),
-                          response.hasSource,
-                          !response.hasTarget {
-                    await MainActor.run {
-                        popup.update("意群: \(response.source)\n释义: 正在补译...")
-                    }
-                    let fallbackSelection = WordSelection(
-                        word: response.source,
-                        context: response.source,
-                        wordRangeInContext: 0..<response.source.utf16.count
-                    )
-                    var fallbackConfig = config
-                    fallbackConfig.promptTemplate = PromptBuilder.translationOnlyPromptTemplate
-                    var fallbackOutput = ""
-                    for try await delta in client.streamExplanation(selection: fallbackSelection, config: fallbackConfig) {
-                        fallbackOutput += delta
+                } else if let response = SenseGroupResponseRenderer.response(for: output) {
+                    if SenseGroupResponseRenderer.needsTranslationFallback(
+                        response,
+                        targetLanguage: config.targetLanguage
+                    ) {
+                        let fallbackSource = response.source.isEmpty ? selection.word : response.source
                         await MainActor.run {
-                            let target = fallbackOutput.trimmingCharacters(in: .whitespacesAndNewlines)
-                            popup.update("意群: \(response.source)\n释义: \(target.isEmpty ? "正在补译..." : target)")
+                            popup.update("意群: \(fallbackSource)\n释义: 正在补译...")
                         }
-                    }
-                    if fallbackOutput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        let fallbackSelection = WordSelection(
+                            word: fallbackSource,
+                            context: fallbackSource,
+                            wordRangeInContext: 0..<fallbackSource.utf16.count
+                        )
+                        var fallbackConfig = config
+                        fallbackConfig.promptTemplate = PromptBuilder.translationOnlyPromptTemplate
+                        var fallbackOutput = ""
+                        for try await delta in client.streamExplanation(selection: fallbackSelection, config: fallbackConfig) {
+                            fallbackOutput += delta
+                            await MainActor.run {
+                                let target = SenseGroupResponseRenderer.plainTranslationText(for: fallbackOutput)
+                                popup.update("意群: \(fallbackSource)\n释义: \(target.isEmpty ? "正在补译..." : target)")
+                            }
+                        }
+                        let finalTarget = SenseGroupResponseRenderer.plainTranslationText(for: fallbackOutput)
                         await MainActor.run {
-                            popup.update("意群: \(response.source)\n释义: 模型没有返回译文，请重试。")
+                            popup.update(
+                                "意群: \(fallbackSource)\n释义: \(finalTarget.isEmpty ? "模型没有返回译文，请重试。" : finalTarget)"
+                            )
+                        }
+                    } else {
+                        await MainActor.run {
+                            popup.update(SenseGroupResponseRenderer.displayText(for: output))
                         }
                     }
                 } else if SenseGroupResponseRenderer.isLikelyStructuredResponse(output),

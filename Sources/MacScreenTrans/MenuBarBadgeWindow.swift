@@ -5,6 +5,8 @@ final class MenuBarBadgeWindowController {
     private let panel: NSPanel
     private let badgeView: MenuBarBadgeView
     nonisolated(unsafe) private var screenChangeObserver: NSObjectProtocol?
+    nonisolated(unsafe) private var appResignObserver: NSObjectProtocol?
+    nonisolated(unsafe) private var appActivateObserver: NSObjectProtocol?
 
     init(menu: NSMenu) {
         badgeView = MenuBarBadgeView(menu: menu)
@@ -14,12 +16,14 @@ final class MenuBarBadgeWindowController {
             backing: .buffered,
             defer: false
         )
-        panel.level = .statusBar
+        panel.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.mainMenuWindow)) + 1)
         panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
         panel.backgroundColor = .clear
         panel.isOpaque = false
         panel.hasShadow = false
         panel.hidesOnDeactivate = false
+        panel.canHide = false
+        panel.isReleasedWhenClosed = false
         panel.ignoresMouseEvents = false
         panel.contentView = badgeView
 
@@ -29,6 +33,22 @@ final class MenuBarBadgeWindowController {
             queue: .main
         ) { [weak self] _ in
             Task { @MainActor in self?.reposition() }
+        }
+
+        appResignObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didResignActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.show() }
+        }
+
+        appActivateObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didBecomeActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.show() }
         }
     }
 
@@ -51,6 +71,12 @@ final class MenuBarBadgeWindowController {
     deinit {
         if let screenChangeObserver {
             NotificationCenter.default.removeObserver(screenChangeObserver)
+        }
+        if let appResignObserver {
+            NotificationCenter.default.removeObserver(appResignObserver)
+        }
+        if let appActivateObserver {
+            NotificationCenter.default.removeObserver(appActivateObserver)
         }
     }
 }

@@ -84,6 +84,34 @@ import Testing
     #expect(SenseGroupResponseRenderer.displayText(for: raw) == "意群: given a sentence\n释义: 正在补译...")
 }
 
+@Test func senseGroupRendererRequestsFallbackForMissingOrNonChineseTarget() throws {
+    let sourceOnly = try #require(SenseGroupResponseRenderer.response(for: "{\"source_chunk\":\"exact substring of the sentence\"}"))
+    let englishTarget = try #require(
+        SenseGroupResponseRenderer.response(
+            for: "{\"source_chunk\":\"exact substring of the sentence\",\"target_chunk\":\"exact substring of the sentence\"}"
+        )
+    )
+    let chineseTarget = try #require(
+        SenseGroupResponseRenderer.response(
+            for: "{\"source_chunk\":\"exact substring of the sentence\",\"target_chunk\":\"句子的精确子字符串\"}"
+        )
+    )
+
+    #expect(SenseGroupResponseRenderer.needsTranslationFallback(sourceOnly, targetLanguage: "zh"))
+    #expect(SenseGroupResponseRenderer.needsTranslationFallback(englishTarget, targetLanguage: "zh"))
+    #expect(!SenseGroupResponseRenderer.needsTranslationFallback(chineseTarget, targetLanguage: "zh"))
+}
+
+@Test func senseGroupRendererCleansFallbackTranslationText() {
+    #expect(SenseGroupResponseRenderer.plainTranslationText(for: "\"句子的精确子字符串\"") == "句子的精确子字符串")
+    #expect(SenseGroupResponseRenderer.plainTranslationText(for: "释义: 句子的精确子字符串") == "句子的精确子字符串")
+    #expect(
+        SenseGroupResponseRenderer.plainTranslationText(
+            for: "{\"source_chunk\":\"exact substring of the sentence\",\"target_text\":\"句子的精确子字符串\"}"
+        ) == "句子的精确子字符串"
+    )
+}
+
 @Test func promptBuilderUsesConfiguredTemplateAndPayload() {
     let selection = WordSelection(word: "twist", context: "It's an ironic twist.", wordRangeInContext: 15..<20)
     let config = TranslationConfig(
@@ -193,6 +221,48 @@ import Testing
     detector.process(contactCount: 2, timestamp: 10.1)
     detector.process(contactCount: 3, timestamp: 10.5)
     detector.process(contactCount: 4, timestamp: 10.6)
+
+    #expect(count == 0)
+}
+
+@Test func threeFingerTapDetectorAcceptsRealisticReleaseRamp() {
+    // MultitouchSupport rarely reports a clean 3 → 0 transition; fingers lift
+    // one at a time, so the typical sequence is 0 → 1 → 2 → 3 → 2 → 1 → 0.
+    var recognized = false
+    var detector = ThreeFingerTapDetector { recognized = true }
+
+    detector.process(contactCount: 1, timestamp: 10.00)
+    detector.process(contactCount: 2, timestamp: 10.01)
+    detector.process(contactCount: 3, timestamp: 10.02)
+    detector.process(contactCount: 2, timestamp: 10.10)
+    detector.process(contactCount: 1, timestamp: 10.11)
+    detector.process(contactCount: 0, timestamp: 10.12)
+
+    #expect(recognized)
+}
+
+@Test func threeFingerTapDetectorRejectsFourFingerTap() {
+    var count = 0
+    var detector = ThreeFingerTapDetector { count += 1 }
+
+    detector.process(contactCount: 1, timestamp: 10.00)
+    detector.process(contactCount: 2, timestamp: 10.01)
+    detector.process(contactCount: 3, timestamp: 10.02)
+    detector.process(contactCount: 4, timestamp: 10.03)
+    detector.process(contactCount: 3, timestamp: 10.10)
+    detector.process(contactCount: 0, timestamp: 10.12)
+
+    #expect(count == 0)
+}
+
+@Test func threeFingerTapDetectorRejectsTwoFingerTap() {
+    var count = 0
+    var detector = ThreeFingerTapDetector { count += 1 }
+
+    detector.process(contactCount: 1, timestamp: 10.00)
+    detector.process(contactCount: 2, timestamp: 10.02)
+    detector.process(contactCount: 1, timestamp: 10.10)
+    detector.process(contactCount: 0, timestamp: 10.12)
 
     #expect(count == 0)
 }

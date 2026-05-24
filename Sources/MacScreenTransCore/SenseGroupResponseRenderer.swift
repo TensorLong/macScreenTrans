@@ -21,8 +21,14 @@ public enum SenseGroupResponseRenderer {
             return nil
         }
 
-        let source = firstString(in: object, keys: ["source_chunk", "chunk", "source", "source_text"])
-        let target = firstString(in: object, keys: ["target_chunk", "translation", "target", "translated_text"])
+        let source = firstString(
+            in: object,
+            keys: ["source_chunk", "chunk", "source", "source_text", "source_phrase", "phrase", "sense_group"]
+        )
+        let target = firstString(
+            in: object,
+            keys: ["target_chunk", "translation", "target", "translated_text", "target_text", "target_phrase", "translated", "meaning"]
+        )
 
         guard !source.isEmpty || !target.isEmpty else {
             return nil
@@ -50,6 +56,51 @@ public enum SenseGroupResponseRenderer {
             lines.append("释义: \(response.target)")
         }
         return lines.isEmpty ? "正在等待规范译文..." : lines.joined(separator: "\n")
+    }
+
+    public static func needsTranslationFallback(
+        _ response: SenseGroupDisplayResponse,
+        targetLanguage: String
+    ) -> Bool {
+        let source = response.source.trimmingCharacters(in: .whitespacesAndNewlines)
+        let target = response.target.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !target.isEmpty else { return true }
+
+        if !source.isEmpty, source.compare(target, options: [.caseInsensitive, .diacriticInsensitive]) == .orderedSame {
+            return true
+        }
+
+        if targetLanguage.lowercased().hasPrefix("zh"),
+           source.containsLatinLetter,
+           !target.containsCJKCharacter {
+            return true
+        }
+
+        return isPromptPlaceholder(target)
+    }
+
+    public static func plainTranslationText(for rawText: String) -> String {
+        let trimmed = stripMarkdownFence(rawText.trimmingCharacters(in: .whitespacesAndNewlines))
+        if let response = response(for: trimmed), response.hasTarget {
+            return response.target
+        }
+
+        var text = trimmed
+        if let data = trimmed.data(using: .utf8),
+           let value = try? JSONSerialization.jsonObject(with: data) as? String {
+            text = value
+        }
+
+        for prefix in ["释义:", "翻译:", "Translation:", "translation:"] where text.hasPrefix(prefix) {
+            text = String(text.dropFirst(prefix.count)).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        if text.count >= 2,
+           ((text.hasPrefix("\"") && text.hasSuffix("\"")) || (text.hasPrefix("'") && text.hasSuffix("'"))) {
+            text = String(text.dropFirst().dropLast())
+        }
+
+        return text.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     public static func isLikelyStructuredResponse(_ rawText: String) -> Bool {
@@ -87,4 +138,30 @@ public enum SenseGroupResponseRenderer {
         return lines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    private static func isPromptPlaceholder(_ text: String) -> Bool {
+        let normalized = text
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        return normalized == "exact substring of the sentence" ||
+            normalized == "smallest meaningful phrase" ||
+            normalized == "target language" ||
+            normalized == "..."
+    }
+}
+
+private extension String {
+    var containsCJKCharacter: Bool {
+        unicodeScalars.contains { scalar in
+            switch scalar.value {
+            case 0x3400...0x4DBF, 0x4E00...0x9FFF, 0xF900...0xFAFF:
+                return true
+            default:
+                return false
+            }
+        }
+    }
+
+    var containsLatinLetter: Bool {
+        range(of: "[A-Za-z]", options: .regularExpression) != nil
+    }
 }
