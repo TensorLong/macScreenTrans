@@ -49,6 +49,7 @@ private struct SettingsView: View {
                 configurationPanel
                 actionsPanel
                 advancedSettings
+                versionFooter
             }
             .padding(24)
         }
@@ -58,6 +59,14 @@ private struct SettingsView: View {
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             refreshStatuses()
         }
+    }
+
+    private var versionFooter: some View {
+        Text("MacScreenTrans v\(AppConfiguration.appVersion)")
+            .font(.system(size: 11))
+            .foregroundStyle(Color(nsColor: .secondaryLabelColor))
+            .frame(maxWidth: .infinity, alignment: .trailing)
+            .padding(.top, 4)
     }
 
     private var header: some View {

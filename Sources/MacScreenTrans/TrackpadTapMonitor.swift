@@ -10,6 +10,14 @@ final class TrackpadTapMonitor: @unchecked Sendable {
     private(set) var isRunning = false
     private(set) var lastError: String?
 
+    /// Diagnostic surface: the detector's last-rejection string, read across
+    /// the queue boundary. Used by the settings self-check report so the
+    /// user can see why a 3-finger gesture they just performed didn't fire
+    /// instead of having to ask the QA (us) to read source.
+    var lastRejection: String {
+        queue.sync { detector.lastRejection }
+    }
+
     init() {
         detector = ThreeFingerTapDetector {}
         detector = ThreeFingerTapDetector { [weak self] in

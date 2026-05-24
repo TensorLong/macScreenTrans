@@ -19,6 +19,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }()
     private lazy var highlightOverlay = WordHighlightOverlayController()
     private lazy var phraseOverlay = PhraseHighlightOverlayController()
+    private lazy var shortcutMonitor = GlobalShortcutMonitor()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         AppConfiguration.bootstrapDefaults()
@@ -41,6 +42,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         trackpadMonitor.start()
 
+        shortcutMonitor.start { [weak self] in
+            Task { @MainActor in
+                self?.handleThreeFingerTap()
+            }
+        }
+
         settingsWindow?.show()
         if !PermissionHelper.accessibilityTrusted || !AppConfiguration.hasMinimumLLMConfig {
             PermissionHelper.promptForAccessibility()
@@ -55,6 +62,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         streamingTask?.cancel()
         trackpadMonitor.stop()
+        shortcutMonitor.stop()
     }
 
     private func configureStatusItem() {
@@ -83,7 +91,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         mainMenu.addItem(appMenuItem)
 
         let appMenu = NSMenu()
-        appMenu.addItem(menuItem("翻译光标下文本", action: #selector(translateUnderCursor), keyEquivalent: "t"))
+        let translateItem = menuItem("翻译光标下文本", action: #selector(translateUnderCursor), keyEquivalent: "t")
+        translateItem.keyEquivalentModifierMask = [.command, .option]
+        appMenu.addItem(translateItem)
         appMenu.addItem(menuItem("权限自检", action: #selector(runSelfCheck), keyEquivalent: ""))
         appMenu.addItem(.separator())
         appMenu.addItem(menuItem("设置...", action: #selector(showSettings), keyEquivalent: ","))
@@ -108,6 +118,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func rebuildStatusMenu() {
         statusMenu.removeAllItems()
+        statusMenu.addItem(disabledMenuItem("MacScreenTrans v\(AppConfiguration.appVersion)"))
+        statusMenu.addItem(.separator())
         statusMenu.addItem(disabledMenuItem(trackpadMonitor.isRunning ? "监听：开启" : "监听：关闭"))
         statusMenu.addItem(menuItem("翻译光标下文本", action: #selector(translateUnderCursor), keyEquivalent: ""))
         statusMenu.addItem(.separator())
@@ -425,6 +437,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         API Key：\(apiKeyOK ? "已配置" : "缺失")
         Model：\(modelOK ? "已配置" : "缺失")
         目标语言：\(config.targetLanguage)
+        最近一次手势判定：\(trackpadMonitor.lastRejection)
         """
     }
 }

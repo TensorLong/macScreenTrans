@@ -34,7 +34,7 @@ let package = Package(
         ),
         .testTarget(
             name: "MacScreenTransCoreTests",
-            dependencies: ["MacScreenTransCore"]
+            dependencies: ["MacScreenTransCore", "CMultitouchSupport"]
         )
     ]
 )

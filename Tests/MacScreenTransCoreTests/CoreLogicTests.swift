@@ -1,6 +1,7 @@
 import CoreGraphics
 import Foundation
 import Testing
+import CMultitouchSupport
 @testable import MacScreenTransCore
 
 @Test func endpointResolverAvoidsDuplicatingV1Path() {
@@ -356,7 +357,7 @@ import Testing
 
 @Test func threeFingerTapDetectorRejectsThreeFingerSwipeByDrift() {
     // System three-finger swipe (Mission Control, desktop switching): the
-    // centroid drifts a long way across the trackpad. Drift > 0.05 must reject.
+    // centroid drifts a long way across the trackpad. Drift > 0.08 must reject.
     var recognized = false
     var detector = ThreeFingerTapDetector { recognized = true }
 
@@ -392,25 +393,25 @@ import Testing
 }
 
 @Test func threeFingerTapDetectorAcceptsDriftJustBelowThreshold() {
-    // Drift = 0.049 (just under the 0.05 ceiling) — should fire.
+    // Drift = 0.079 (just under the 0.08 ceiling) — should fire.
     var recognized = false
     var detector = ThreeFingerTapDetector { recognized = true }
 
     detector.process(contactCount: 3, timestamp: 10.00, centroidX: 0.5, centroidY: 0.5)
-    detector.process(contactCount: 3, timestamp: 10.05, centroidX: 0.549, centroidY: 0.5)
-    detector.process(contactCount: 0, timestamp: 10.10, centroidX: 0.549, centroidY: 0.5)
+    detector.process(contactCount: 3, timestamp: 10.05, centroidX: 0.579, centroidY: 0.5)
+    detector.process(contactCount: 0, timestamp: 10.10, centroidX: 0.579, centroidY: 0.5)
 
     #expect(recognized)
 }
 
 @Test func threeFingerTapDetectorRejectsDriftJustAboveThreshold() {
-    // Drift = 0.051 (just over the 0.05 ceiling) — should reject.
+    // Drift = 0.081 (just over the 0.08 ceiling) — should reject.
     var recognized = false
     var detector = ThreeFingerTapDetector { recognized = true }
 
     detector.process(contactCount: 3, timestamp: 10.00, centroidX: 0.5, centroidY: 0.5)
-    detector.process(contactCount: 3, timestamp: 10.05, centroidX: 0.551, centroidY: 0.5)
-    detector.process(contactCount: 0, timestamp: 10.10, centroidX: 0.551, centroidY: 0.5)
+    detector.process(contactCount: 3, timestamp: 10.05, centroidX: 0.581, centroidY: 0.5)
+    detector.process(contactCount: 0, timestamp: 10.10, centroidX: 0.581, centroidY: 0.5)
 
     #expect(!recognized)
 }
@@ -418,6 +419,7 @@ import Testing
 @Test func threeFingerTapDetectorTracksPeakDriftEvenIfFingersReturn() {
     // Centroid drifts to 0.6 mid-touch then returns to start. The detector
     // should record max drift = 0.1 across the lifetime, not final drift = 0.
+    // 0.1 > 0.08 ceiling, so this must still reject.
     var recognized = false
     var detector = ThreeFingerTapDetector { recognized = true }
 
@@ -508,6 +510,96 @@ import Testing
     // The tail still points at the word's center, even though the popup is offset.
     let tailScreenX = placement.origin.x + placement.tailX
     #expect(abs(tailScreenX - word.midX) < 0.001)
+}
+
+// MARK: - C-bridge centroid tests
+//
+// These two tests close the v0.2.1 coverage gap. v0.2.1 shipped a 120-byte
+// MSMTTouch where the canonical layout is 96 bytes. `touches[0]` happened to
+// be correct (normalizedVector at offset 32 either way) but touches[i] for
+// i >= 1 read garbage from the canonical `angle` / `majorAxis` bytes — the
+// centroid drifted wildly and every 3-finger tap was rejected. These tests
+// drive `MSComputeCentroid` directly with a synthesized 96-byte-per-touch
+// buffer so the bug would be caught immediately by `scripts/test`, without
+// the user needing to be the QA.
+
+/// Per-touch stride is locked to the canonical MTTouch size of 96 bytes.
+private let mtTouchStride = 96
+
+/// Byte offsets inside MTTouch — must match the C struct layout in
+/// `CMultitouchSupport.c`. The static_asserts in the C file guard the C
+/// side; this constant set guards the test fixture against drift.
+private enum MTTouchOffset {
+    static let state = 20
+    static let normalizedPosX = 32
+    static let normalizedPosY = 36
+}
+
+/// Writes a 4-byte little-endian Int32 at `offset` into `buffer`.
+private func writeInt32(_ value: Int32, at offset: Int, into buffer: UnsafeMutableRawPointer) {
+    buffer.advanced(by: offset).bindMemory(to: Int32.self, capacity: 1).pointee = value
+}
+
+/// Writes a 4-byte float at `offset` into `buffer`.
+private func writeFloat(_ value: Float, at offset: Int, into buffer: UnsafeMutableRawPointer) {
+    buffer.advanced(by: offset).bindMemory(to: Float.self, capacity: 1).pointee = value
+}
+
+/// Fills the `i`-th touch slot (each 96 bytes) inside `buffer` with the
+/// supplied `state`, normalized x and normalized y.
+private func writeTouch(into buffer: UnsafeMutableRawPointer, index: Int, state: Int32, x: Float, y: Float) {
+    let slot = buffer.advanced(by: index * mtTouchStride)
+    writeInt32(state, at: MTTouchOffset.state, into: slot)
+    writeFloat(x, at: MTTouchOffset.normalizedPosX, into: slot)
+    writeFloat(y, at: MTTouchOffset.normalizedPosY, into: slot)
+}
+
+@Test func cBridgeCentroidAveragesThreeFirmTouches() {
+    // Three firm touches (state = 4 = Touching) at (0.3, 0.4), (0.5, 0.4),
+    // (0.7, 0.4). The centroid must be the arithmetic mean of the three:
+    // ((0.3 + 0.5 + 0.7) / 3, 0.4) = (0.5, 0.4). firmCount must be 3.
+    let byteCount = mtTouchStride * 3
+    let buffer = UnsafeMutableRawPointer.allocate(byteCount: byteCount, alignment: 8)
+    defer { buffer.deallocate() }
+    memset(buffer, 0, byteCount)
+
+    writeTouch(into: buffer, index: 0, state: 4, x: 0.3, y: 0.4)
+    writeTouch(into: buffer, index: 1, state: 4, x: 0.5, y: 0.4)
+    writeTouch(into: buffer, index: 2, state: 4, x: 0.7, y: 0.4)
+
+    var firmCount: Int32 = 0
+    var cx: Float = 0
+    var cy: Float = 0
+    MSComputeCentroid(buffer, 3, &firmCount, &cx, &cy)
+
+    #expect(firmCount == 3)
+    #expect(abs(cx - 0.5) < 0.0001)
+    #expect(abs(cy - 0.4) < 0.0001)
+}
+
+@Test func cBridgeCentroidExcludesLiftingFingers() {
+    // Three touch slots, but only two are firm (state = 4). The third is in
+    // state = 5 (BreakTouch — finger lifting). The centroid must average
+    // ONLY the firm touches: ((0.3 + 0.5) / 2, 0.4) = (0.4, 0.4). firmCount
+    // must be 2 so the downstream Swift detector doesn't see "3 fingers"
+    // when one is on the way out.
+    let byteCount = mtTouchStride * 3
+    let buffer = UnsafeMutableRawPointer.allocate(byteCount: byteCount, alignment: 8)
+    defer { buffer.deallocate() }
+    memset(buffer, 0, byteCount)
+
+    writeTouch(into: buffer, index: 0, state: 4, x: 0.3, y: 0.4)
+    writeTouch(into: buffer, index: 1, state: 4, x: 0.5, y: 0.4)
+    writeTouch(into: buffer, index: 2, state: 5, x: 0.99, y: 0.99)  // lifting — must be ignored
+
+    var firmCount: Int32 = 0
+    var cx: Float = 0
+    var cy: Float = 0
+    MSComputeCentroid(buffer, 3, &firmCount, &cx, &cy)
+
+    #expect(firmCount == 2)
+    #expect(abs(cx - 0.4) < 0.0001)
+    #expect(abs(cy - 0.4) < 0.0001)
 }
 
 private extension String {

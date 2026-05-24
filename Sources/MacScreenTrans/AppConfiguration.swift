@@ -71,4 +71,13 @@ enum AppConfiguration {
             EndpointResolver.chatCompletionsURL(baseURL: config.endpoint) != nil &&
             !config.model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
+
+    /// Marketing version pulled from `CFBundleShortVersionString` so the
+    /// menu bar item and Settings footer stay in sync with the plist
+    /// without code edits at release time. Falls back to "?" if the
+    /// Info dictionary is unreadable (e.g. running as a raw SwiftPM
+    /// executable without the app bundle around it).
+    static var appVersion: String {
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?"
+    }
 }

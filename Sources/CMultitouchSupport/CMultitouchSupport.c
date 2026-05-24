@@ -3,6 +3,8 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <dlfcn.h>
 #include <stdio.h>
+#include <stdint.h>
+#include <stddef.h>
 #include <string.h>
 
 typedef void *MTDeviceRef;
@@ -13,36 +15,47 @@ typedef void (*MTUnregisterContactFrameCallbackFunction)(MTDeviceRef device, MTC
 typedef void (*MTDeviceStartFunction)(MTDeviceRef device, int flags);
 typedef void (*MTDeviceStopFunction)(MTDeviceRef device);
 
-// MultitouchSupport private per-finger payload (reverse-engineered, stable across
-// macOS versions used by OpenMultitouchSupport, mac-gesture, Hammerspoon, etc.).
-// We only need normalizedVector.{x,y}; the rest of the struct exists to keep the
-// memory layout correct when indexing into the array MultitouchSupport hands us.
+// Canonical MTTouch layout (96 bytes) as reverse-engineered by:
+//   - mkalten/twongseng
+//   - ofxTouchPad
+//   - asmagill/Hammerspoon
+//   - KSroido
+//   - rmhsilva
+// All five independent sources agree on this layout. v0.2.1 shipped with a
+// 120-byte struct, so touches[i].normalizedVector for i >= 1 read garbage
+// from the canonical touches[i].angle / majorAxis bytes — the centroid
+// drifted wildly and every 3-finger tap was rejected.
 typedef struct {
     float x;
     float y;
-    float vx;
-    float vy;
-} MSMTPoint;
+} MSMTPointXY;
 
 typedef struct {
-    int frame;
-    double timestamp;
-    int identifier;
-    int state;
-    int finger;
-    int hand;
-    MSMTPoint normalizedVector;
-    MSMTPoint absoluteVector;
-    int unknown1[2];
-    float size;
-    int unknown2;
-    float angle;
-    float majorAxis;
-    float minorAxis;
-    MSMTPoint mm;
-    int unknown3[2];
-    float zDensity;
-} MSMTTouch;
+    MSMTPointXY position;
+    MSMTPointXY velocity;
+} MSMTVector;
+
+typedef struct {
+    int32_t  frame;          // offset 0
+    double   timestamp;      // offset 8 (with 4-byte pad)
+    int32_t  pathIndex;      // offset 16
+    int32_t  state;          // offset 20  (1=MakeTouch, 4=Touching, 5=BreakTouch, etc.)
+    int32_t  fingerID;       // offset 24
+    int32_t  handID;         // offset 28
+    MSMTVector normalizedVector;  // offset 32 (16 bytes: pos.x, pos.y, vel.x, vel.y)
+    float    zTotal;         // offset 48
+    int32_t  field9;         // offset 52
+    float    angle;          // offset 56
+    float    majorAxis;      // offset 60
+    float    minorAxis;      // offset 64
+    MSMTVector absoluteVector;    // offset 68 (mm)
+    int32_t  field14;        // offset 84
+    int32_t  field15;        // offset 88
+    float    zDensity;       // offset 92
+} MSMTTouch;  // sizeof = 96
+
+_Static_assert(sizeof(MSMTTouch) == 96, "MSMTTouch layout drifted from canonical MTTouch");
+_Static_assert(__builtin_offsetof(MSMTTouch, normalizedVector) == 32, "normalizedVector must live at offset 32");
 
 static void *gFramework = NULL;
 static CFMutableArrayRef gDevices = NULL;
@@ -58,25 +71,38 @@ static void writeError(char *buffer, int length, const char *message) {
     snprintf(buffer, (size_t)length, "%s", message);
 }
 
+void MSComputeCentroid(const void *touchesBuffer, int contactCount,
+                       int *firmCount, float *outX, float *outY) {
+    const MSMTTouch *touches = (const MSMTTouch *)touchesBuffer;
+    int firm = 0;
+    float sumX = 0.0f, sumY = 0.0f;
+    for (int i = 0; i < contactCount; i++) {
+        int state = touches[i].state;
+        if (state == 3 || state == 4) {
+            sumX += touches[i].normalizedVector.position.x;
+            sumY += touches[i].normalizedVector.position.y;
+            firm++;
+        }
+    }
+    if (firm > 0) {
+        *outX = sumX / (float)firm;
+        *outY = sumY / (float)firm;
+    } else {
+        *outX = 0.0f;
+        *outY = 0.0f;
+    }
+    *firmCount = firm;
+}
+
 static int touchFrameCallback(MTDeviceRef device, void *data, int contactCount, double timestamp, int frame) {
     (void)device;
-
-    float centroidX = 0.0f;
-    float centroidY = 0.0f;
-    if (contactCount > 0 && data != NULL) {
-        const MSMTTouch *touches = (const MSMTTouch *)data;
-        float sumX = 0.0f;
-        float sumY = 0.0f;
-        for (int i = 0; i < contactCount; i++) {
-            sumX += touches[i].normalizedVector.x;
-            sumY += touches[i].normalizedVector.y;
-        }
-        centroidX = sumX / (float)contactCount;
-        centroidY = sumY / (float)contactCount;
+    int firm = 0;
+    float cx = 0.0f, cy = 0.0f;
+    if (data && contactCount > 0) {
+        MSComputeCentroid(data, contactCount, &firm, &cx, &cy);
     }
-
     if (gCallback != NULL) {
-        gCallback(contactCount, timestamp, frame, centroidX, centroidY, gContext);
+        gCallback(firm, timestamp, frame, cx, cy, gContext);
     }
     return 0;
 }
