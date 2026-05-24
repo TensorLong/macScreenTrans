@@ -37,9 +37,15 @@ private struct SettingsView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
-            Text("MacScreenTrans")
-                .font(.title2)
-                .fontWeight(.semibold)
+            HStack {
+                Text("MacScreenTrans")
+                    .font(.title2)
+                    .fontWeight(.semibold)
+                Spacer()
+                Button("Quit") {
+                    NSApp.terminate(nil)
+                }
+            }
 
             Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 12) {
                 GridRow {
@@ -89,6 +95,9 @@ private struct SettingsView: View {
                 Button("Open Accessibility Settings") {
                     PermissionHelper.openAccessibilitySettings()
                 }
+                Spacer()
+                Text("Menu bar item: 译")
+                    .foregroundStyle(.secondary)
             }
 
             if !selfCheckResult.isEmpty {

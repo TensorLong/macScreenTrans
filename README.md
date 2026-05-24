@@ -2,11 +2,11 @@
 
 MacScreenTrans is a macOS status bar translator. Point at a word, trigger the app, and it uses Accessibility plus an OpenAI-compatible streaming API to translate the smallest meaningful phrase that contains that word.
 
-When launched, MacScreenTrans opens its Settings window and keeps running from the `译` item in the macOS menu bar.
+When launched, MacScreenTrans opens its Settings window, appears as a normal app, and also keeps a `译` item in the macOS menu bar.
 
 ## Features
 
-- Visible `译` status bar item with Settings, permission self-check, listening controls, and Quit.
+- Normal app window plus a visible `译` status bar item with Settings, permission self-check, listening controls, and Quit.
 - Three-finger tap listener for translating the word under the cursor.
 - Accessibility-only text capture.
 - OpenRouter/OpenAI-compatible API settings for endpoint URL, API key, model, target language, and prompt template.
