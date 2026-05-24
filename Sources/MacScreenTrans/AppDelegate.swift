@@ -3,7 +3,7 @@ import MacScreenTransCore
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+    private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
     private let trackpadMonitor = TrackpadTapMonitor()
     private let popup = FloatingTranslationWindowController()
     private let client = OpenAIStreamingClient()
@@ -32,8 +32,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         trackpadMonitor.start()
 
+        settingsWindow?.show()
         if !PermissionHelper.accessibilityTrusted || !AppConfiguration.hasMinimumLLMConfig {
-            settingsWindow?.show()
             PermissionHelper.promptForAccessibility()
         }
     }
@@ -45,12 +45,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func configureStatusItem() {
-        if let image = NSImage(systemSymbolName: "character.bubble", accessibilityDescription: "MacScreenTrans") {
-            image.isTemplate = true
-            statusItem.button?.image = image
-        } else {
-            statusItem.button?.title = "译"
-        }
+        statusItem.button?.title = "译"
         statusItem.button?.toolTip = "MacScreenTrans"
 
         let menu = NSMenu()
