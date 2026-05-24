@@ -59,11 +59,15 @@ enum AXWordReader {
         ///   2. If exact fails, retry with a normalized (lower / collapsed
         ///      whitespace / stripped punctuation) match, mapping the result
         ///      back to the original UTF-16 range.
-        ///   3. Split the matched UTF-16 range per visual line via
-        ///      `kAXLineForIndex` + `kAXRangeForLine`. For each line, ask
-        ///      AX for the bounds rect and slice the substring text.
-        ///   4. If per-line APIs aren't implemented, fall back to a single
-        ///      whole-phrase bounds rect.
+        ///   3. Per-character scan the matched UTF-16 range and Y-cluster
+        ///      the rects into visual lines. We avoid `kAXLineForIndex` /
+        ///      `kAXRangeForLine` because WebKit doesn't implement them —
+        ///      that path silently returned the enclosing rect for multi-
+        ///      line ranges in v0.2 and made the green band engulf entire
+        ///      paragraphs (Issue 1).
+        ///   4. If the per-character scan returns nothing, fall back to a
+        ///      single `boundsForRange` rect, sanity-checked against a
+        ///      single-char probe to refuse paragraph-tall rects.
         func phraseSegments(for phrase: String) -> [PhraseSegment] {
             AXWordReader.phraseSegments(for: phrase, lookup: phraseLookup, selection: selection)
         }
@@ -187,7 +191,13 @@ enum AXWordReader {
             diag.append("word=\"\(resolved.selection.word)\" via kAXStringForRange (offset \(resolved.offset))")
         }
 
-        let wordRect = boundsForRange(element: element, range: wordUTF16Range)
+        let wordRect = resolveWordRect(
+            element: element,
+            range: wordUTF16Range,
+            elementText: lookupElementText,
+            cursorAxPoint: axPoint,
+            diag: &diag
+        )
         diag.append("wordRect=\(wordRect.map { "(\(Int($0.minX)),\(Int($0.minY))) \(Int($0.width))×\(Int($0.height))" } ?? "nil")")
         logger.debug("resolve OK: word=\"\(selection.word)\"")
 
@@ -264,23 +274,49 @@ enum AXWordReader {
         diag.append("hit=\(hitKind)")
         diag.append("range=loc=\(phraseRange.location) len=\(phraseRange.length)")
 
-        // Step 2: split per visual line using kAXLineForIndex /
-        // kAXRangeForLine. Fall back to a single whole-range bounds when
-        // those APIs aren't supported by the element.
+        // Step 2: split per visual line by Y-clustering per-character bounds.
+        // This works on WebKit too, where the older kAXLineForIndex /
+        // kAXRangeForLine path silently returned the enclosing rect for
+        // multi-line ranges (Issue 1).
         if let segments = perLineSegments(
             element: lookup.element,
             elementText: lookup.elementText,
             phraseRange: phraseRange
         ), !segments.isEmpty {
+            // Sanity-check: if the segment heights are wildly inconsistent
+            // with each other, AX returned garbage. Compare the union height
+            // to the median per-segment height; a ratio > 2.5 means at least
+            // one segment is enclosing the whole multi-line range. Refuse
+            // green in that case rather than draw a paragraph-sized bubble.
+            let sortedHeights = segments.map(\.rect.height).sorted()
+            let medianHeight = sortedHeights[sortedHeights.count / 2]
+            var unionRect = segments[0].rect
+            for s in segments.dropFirst() { unionRect = unionRect.union(s.rect) }
+            if medianHeight > 0, unionRect.height > 2.5 * medianHeight,
+               segments.count == 1 {
+                diag.append("lines=reject(single tall seg \(Int(unionRect.height))pt > 2.5× median \(Int(medianHeight))pt)")
+                return []
+            }
             diag.append("lines=\(segments.count) segs=\(segments.count)")
             return segments
         }
 
         // Fallback: a single bubble covering the whole phrase rect. Looks
         // identical to per-line for single-line phrases; lumps multi-line
-        // phrases into one tall box, which is acceptable when AX won't
-        // tell us where the line breaks are.
+        // phrases into one tall box. Before accepting it, probe a single
+        // character at the phrase start to estimate the line height — if
+        // the whole-phrase rect is more than 2.5× that, AX is giving us a
+        // multi-line enclosing rect and we'd draw a paragraph-sized bubble.
+        // Refuse in that case (Issue 1 belt-and-suspenders).
         if let rect = boundsForRange(element: lookup.element, range: phraseRange) {
+            let probe = boundsForRange(
+                element: lookup.element,
+                range: CFRange(location: phraseRange.location, length: 1)
+            )
+            if let probe, probe.height > 0, rect.height > 2.5 * probe.height {
+                diag.append("lines=reject-fallback(whole \(Int(rect.height))pt > 2.5× probe \(Int(probe.height))pt)")
+                return []
+            }
             let text = substring(of: lookup.elementText, utf16Range: phraseRange) ?? phrase
             diag.append("lines=fallback segs=1")
             return [PhraseSegment(rect: rect, text: text)]
@@ -465,6 +501,124 @@ enum AXWordReader {
         return String(source.utf16[start..<end])
     }
 
+    /// Resolve the on-screen rect for `range` with three escalating
+    /// fallbacks. The plain `boundsForRange` call alone returns nil on
+    /// soft-wrap edges, zero-width spaces, and certain web glyphs — that
+    /// nil was the root cause of the yellow box randomly disappearing in
+    /// v0.2 (Issue 3) while the green band still rendered.
+    ///
+    /// Path 1: fast `boundsForRange(range)`, sanity-checked against the
+    ///         height of a single-char probe at the range start. Rejects
+    ///         the WebKit "multi-line enclosing rect" case where a word
+    ///         straddles a wrap and AX hands back a tall paragraph rect.
+    /// Path 2: scan per-character rects across the range, Y-cluster, return
+    ///         the union of the cluster nearest the cursor. Handles the
+    ///         normal soft-wrap case and zero-width-space glyphs.
+    /// Path 3: probe ±20 UTF-16 units around the word range looking for
+    ///         the first char that has any bounds at all, return its rect.
+    ///         Implements "find nearest word" so yellow lands on the
+    ///         visually-adjacent glyph rather than disappearing.
+    private static func resolveWordRect(
+        element: AXUIElement,
+        range: CFRange,
+        elementText: String?,
+        cursorAxPoint: CGPoint,
+        diag: inout [String]
+    ) -> NSRect? {
+        guard range.length > 0 else { return nil }
+
+        // Compare cursor against AppKit-flipped rects coming out of
+        // `boundsForRange`. The class-level `accessibilityPoint(from:)`
+        // does AppKit→Quartz; the inverse uses the same primary-screen
+        // anchor.
+        let primary = NSScreen.screens.first(where: { $0.frame.origin == .zero }) ?? NSScreen.main
+        let cursorAppKit: CGPoint
+        if let primary {
+            cursorAppKit = CGPoint(x: cursorAxPoint.x, y: primary.frame.maxY - cursorAxPoint.y)
+        } else {
+            cursorAppKit = cursorAxPoint
+        }
+
+        // Path 1 — fast path with sanity check on tall multi-line rect.
+        if let direct = boundsForRange(element: element, range: range) {
+            let probe = boundsForRange(
+                element: element,
+                range: CFRange(location: range.location, length: 1)
+            )
+            if let probe, probe.height > 0, direct.height > 1.6 * probe.height {
+                diag.append("wordRect: path1 reject(tall \(Int(direct.height))pt > 1.6× probe \(Int(probe.height))pt)")
+            } else {
+                diag.append("wordRect: path1 ok")
+                return direct
+            }
+        }
+
+        // Path 2 — per-character scan + Y-cluster, pick cluster nearest cursor.
+        let chars = scanCharacterRects(element: element, range: range, elementText: elementText)
+        if !chars.isEmpty {
+            let clusters = clusterByVisualLine(chars)
+            if !clusters.isEmpty {
+                let best = clusters.min { a, b in
+                    let da = abs(a.rect.midY - cursorAppKit.y)
+                    let db = abs(b.rect.midY - cursorAppKit.y)
+                    return da < db
+                }
+                if let best {
+                    diag.append("wordRect: path2 ok (\(clusters.count) clusters)")
+                    return best.rect
+                }
+            }
+        }
+
+        // Path 3 — probe nearby chars for any rect at all. Walk outward from
+        // the range, alternating forward and backward, until we hit a rect.
+        let center = range.location + range.length / 2
+        let maxProbes = 40
+        var probed = 0
+        var forward = range.location + range.length
+        var backward = range.location - 1
+        while probed < maxProbes {
+            if forward - center <= 20 {
+                if let rect = boundsForRange(
+                    element: element,
+                    range: CFRange(location: forward, length: 1)
+                ) {
+                    diag.append("wordRect: path3 ok (forward off=\(forward))")
+                    return rect
+                }
+                forward += 1
+                probed += 1
+            }
+            if probed >= maxProbes { break }
+            if backward >= 0, center - backward <= 20 {
+                if let rect = boundsForRange(
+                    element: element,
+                    range: CFRange(location: backward, length: 1)
+                ) {
+                    diag.append("wordRect: path3 ok (backward off=\(backward))")
+                    return rect
+                }
+                backward -= 1
+                probed += 1
+            }
+            // Bail out when both directions are out of probe budget.
+            if (forward - center > 20) && (backward < 0 || center - backward > 20) {
+                break
+            }
+        }
+
+        diag.append("wordRect: all paths failed")
+        return nil
+    }
+
+    /// Split a phrase range into one segment per visual line by Y-clustering
+    /// per-character bounds. We deliberately avoid `kAXLineForIndex` /
+    /// `kAXRangeForLine` here because WebKit (Twitter/X, Gmail, most web
+    /// surfaces) doesn't implement them — falling back to a single
+    /// `boundsForRange(phraseRange)` on WebKit returns the *enclosing rect*
+    /// for a multi-line range, which is what made the v0.2 green overlay
+    /// "engulf" entire paragraphs and pick up a ~70pt font from the tall
+    /// rect height.
     private static func perLineSegments(
         element: AXUIElement,
         elementText: String,
@@ -472,83 +626,17 @@ enum AXWordReader {
     ) -> [PhraseSegment]? {
         guard phraseRange.length > 0 else { return nil }
 
-        // Probe the first character of the phrase for its line number. If
-        // kAXLineForIndex isn't implemented we'll get nil here and the caller
-        // takes the single-rect fallback path.
-        guard let startLine = lineForIndex(element: element, index: phraseRange.location) else {
-            return nil
-        }
-        let endIndex = phraseRange.location + max(0, phraseRange.length - 1)
-        let endLine = lineForIndex(element: element, index: endIndex) ?? startLine
-
-        var segments: [PhraseSegment] = []
-        let phraseStart = phraseRange.location
-        let phraseEnd = phraseRange.location + phraseRange.length
-
-        let lineCount = max(0, endLine - startLine) + 1
-        // Guard against absurd line counts — keeps a misbehaving AX
-        // implementation from looping unboundedly.
-        let safeLineCount = min(lineCount, 256)
-        for offset in 0..<safeLineCount {
-            let lineNumber = startLine + offset
-            guard let lineRange = rangeForLine(element: element, line: lineNumber) else {
-                // Mid-phrase line lookup failed — abandon per-line mode
-                // and let the caller fall back to a single bounding box.
-                return nil
-            }
-            let lineStart = lineRange.location
-            let lineEnd = lineRange.location + lineRange.length
-            let sliceStart = max(phraseStart, lineStart)
-            let sliceEnd = min(phraseEnd, lineEnd)
-            guard sliceEnd > sliceStart else { continue }
-            let slice = CFRange(location: sliceStart, length: sliceEnd - sliceStart)
-            guard let rect = boundsForRange(element: element, range: slice) else {
-                continue
-            }
-            let text = substring(of: elementText, utf16Range: slice)
-                ?? stringForRange(element: element, location: slice.location, length: slice.length)
-                ?? ""
-            segments.append(PhraseSegment(rect: rect, text: text))
-        }
-
-        return segments.isEmpty ? nil : segments
-    }
-
-    private static func lineForIndex(element: AXUIElement, index: Int) -> Int? {
-        // AXLineForIndex takes a plain CFNumber (CFIndex), not an AXValue
-        // wrapper — only structured types like CFRange/CGRect/CGPoint go
-        // through AXValueCreate.
-        let indexNumber = index as CFNumber
-        var raw: CFTypeRef?
-        let error = AXUIElementCopyParameterizedAttributeValue(
-            element,
-            kAXLineForIndexParameterizedAttribute as CFString,
-            indexNumber,
-            &raw
+        let chars = scanCharacterRects(
+            element: element,
+            range: phraseRange,
+            elementText: elementText
         )
-        guard error == .success, let raw else { return nil }
-        if let number = raw as? NSNumber {
-            return number.intValue
-        }
-        return nil
-    }
+        guard !chars.isEmpty else { return nil }
 
-    private static func rangeForLine(element: AXUIElement, line: Int) -> CFRange? {
-        let lineNumber = line as CFNumber
-        var raw: CFTypeRef?
-        let error = AXUIElementCopyParameterizedAttributeValue(
-            element,
-            kAXRangeForLineParameterizedAttribute as CFString,
-            lineNumber,
-            &raw
-        )
-        guard error == .success, let raw else { return nil }
-        guard CFGetTypeID(raw) == AXValueGetTypeID() else { return nil }
-        var range = CFRange()
-        guard AXValueGetValue(raw as! AXValue, .cfRange, &range), range.location >= 0 else {
-            return nil
-        }
-        return range
+        let clusters = clusterByVisualLine(chars)
+        guard !clusters.isEmpty else { return nil }
+
+        return clusters.map { PhraseSegment(rect: $0.rect, text: $0.text) }
     }
 
     private static func rangeForPosition(element: AXUIElement, point: CGPoint) -> CFRange? {
@@ -669,6 +757,111 @@ enum AXWordReader {
 
         diag.append("all candidates exhausted")
         return nil
+    }
+
+    /// Group a list of per-character rects into visual lines. Walks the
+    /// rects in offset order; when a char's vertical position jumps more
+    /// than `0.5 × medianHeight` from the current cluster's first char, we
+    /// close the cluster and start a new one. Returns one entry per cluster:
+    /// the union of horizontal extent (height taken from the cluster's
+    /// own union) and the concatenation of the cluster's glyphs.
+    static func clusterByVisualLine(
+        _ chars: [(offset: Int, rect: NSRect, glyph: String)]
+    ) -> [(rect: NSRect, text: String)] {
+        guard !chars.isEmpty else { return [] }
+        let sorted = chars.sorted { $0.offset < $1.offset }
+
+        // Median of heights as the line-break threshold reference. We use
+        // height (not pointSize) because that's what AX actually gives us.
+        let heights = sorted.map(\.rect.height).sorted()
+        let medianHeight = heights[heights.count / 2]
+        let threshold = max(1.0, 0.5 * medianHeight)
+
+        var clusters: [[(offset: Int, rect: NSRect, glyph: String)]] = []
+        var current: [(offset: Int, rect: NSRect, glyph: String)] = []
+        var anchorY: CGFloat = sorted[0].rect.minY
+
+        for c in sorted {
+            if current.isEmpty {
+                current.append(c)
+                anchorY = c.rect.minY
+                continue
+            }
+            if abs(c.rect.minY - anchorY) < threshold {
+                current.append(c)
+            } else {
+                clusters.append(current)
+                current = [c]
+                anchorY = c.rect.minY
+            }
+        }
+        if !current.isEmpty {
+            clusters.append(current)
+        }
+
+        var out: [(rect: NSRect, text: String)] = []
+        out.reserveCapacity(clusters.count)
+        for cluster in clusters {
+            guard let first = cluster.first else { continue }
+            var union = first.rect
+            for entry in cluster.dropFirst() {
+                union = union.union(entry.rect)
+            }
+            let text = cluster.map(\.glyph).joined()
+            out.append((union, text))
+        }
+        return out
+    }
+
+    /// Per-character rect scan over a UTF-16 range. Probes each offset with
+    /// a length-1 `kAXBoundsForRange` query, keeps only the ones that return
+    /// a non-degenerate AppKit rect, and pairs each kept rect with the
+    /// corresponding glyph from `elementText` when available. Capped at 600
+    /// iterations so a phrase that accidentally spans a huge AX element
+    /// doesn't stall the AppKit thread. Used by both the per-line phrase
+    /// segmenter (which needs glyphs to slice text per visual line) and the
+    /// word-rect fallback (which only needs rects).
+    static func scanCharacterRects(
+        element: AXUIElement,
+        range: CFRange,
+        elementText: String?
+    ) -> [(offset: Int, rect: NSRect, glyph: String)] {
+        guard range.length > 0 else { return [] }
+        let safeLimit = min(range.length, 600)
+        let start = range.location
+        let end = start + safeLimit
+
+        // Precompute element-text UTF-16 view for fast slicing. Building the
+        // index map for every char would re-walk the string, so we cache it.
+        let utf16View: [UInt16]?
+        if let elementText {
+            utf16View = Array(elementText.utf16)
+        } else {
+            utf16View = nil
+        }
+
+        var out: [(offset: Int, rect: NSRect, glyph: String)] = []
+        out.reserveCapacity(safeLimit)
+        for offset in start..<end {
+            guard let rect = boundsForRange(
+                element: element,
+                range: CFRange(location: offset, length: 1)
+            ) else {
+                continue
+            }
+            let glyph: String
+            if let utf16View, offset >= 0, offset < utf16View.count {
+                if let scalar = Unicode.Scalar(utf16View[offset]) {
+                    glyph = String(scalar)
+                } else {
+                    glyph = ""
+                }
+            } else {
+                glyph = ""
+            }
+            out.append((offset, rect, glyph))
+        }
+        return out
     }
 
     /// Scan each character's bounds and return the one whose rect is closest

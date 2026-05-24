@@ -7,10 +7,19 @@ enum DefaultsKey {
     static let model = "model"
     static let targetLanguage = "targetLanguage"
     static let promptTemplate = "promptTemplate"
+    static let promptTemplateVersion = "promptTemplateVersion"
 }
 
 enum AppConfiguration {
     static let defaultModel = TranslationConfig.defaultModel
+
+    /// Bump this when `PromptBuilder.defaultPromptTemplate` gains required JSON
+    /// fields (or changes rule semantics) that older stored templates won't
+    /// emit. `bootstrapDefaults()` forcibly overwrites the stored prompt
+    /// template when the persisted version is below this number — silent
+    /// migration, no user-facing notification. v2 added rules 10 (word_pos)
+    /// and 11 (word_brief), which v0.1.x stored prompts don't request.
+    private static let currentPromptTemplateVersion = 2
 
     static func bootstrapDefaults() {
         let defaults = UserDefaults.standard
@@ -19,8 +28,23 @@ enum AppConfiguration {
             DefaultsKey.apiKey: "",
             DefaultsKey.model: defaultModel,
             DefaultsKey.targetLanguage: "zh",
-            DefaultsKey.promptTemplate: PromptBuilder.defaultPromptTemplate
+            DefaultsKey.promptTemplate: PromptBuilder.defaultPromptTemplate,
+            // Register 0 so a freshly-installed defaults store reads back
+            // as "needs migration" on first launch, then we bump to current.
+            // A v0.1.x user already has no entry for this key either, so
+            // `integer(forKey:)` returns 0 there too — same migration path.
+            DefaultsKey.promptTemplateVersion: 0
         ])
+
+        let storedVersion = defaults.integer(forKey: DefaultsKey.promptTemplateVersion)
+        if storedVersion < currentPromptTemplateVersion {
+            // Forcibly overwrite the stored prompt template. `register` only
+            // seeds keys that are ABSENT; v0.1.x users have the OLD prompt
+            // frozen in NSUserDefaults, and that stale prompt never asks
+            // the LLM for `word_pos` / `word_brief`. Overwrite + bump.
+            defaults.set(PromptBuilder.defaultPromptTemplate, forKey: DefaultsKey.promptTemplate)
+            defaults.set(currentPromptTemplateVersion, forKey: DefaultsKey.promptTemplateVersion)
+        }
 
         if defaults.string(forKey: DefaultsKey.endpoint) == "https://api.openai.com",
            defaults.string(forKey: DefaultsKey.apiKey)?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false,

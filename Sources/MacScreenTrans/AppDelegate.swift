@@ -166,6 +166,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
+        // Issue 5 — role gate. `AXWordReader.resolve` will gladly return a
+        // stale word from the nearest text element when the cursor sits on
+        // a button / image / empty space, which kicks off the (expensive)
+        // LLM round-trip for a word the user wasn't pointing at. Short-
+        // circuit on non-text roles BEFORE we call resolve. v0.2.1 keeps a
+        // compact debug popup (no LLM call) per explicit user instruction;
+        // v0.3 may swap this for a true visual no-op.
+        let probe = AXTextRoleProbe.probe(at: point)
+        switch probe {
+        case .text:
+            break  // continue to resolve
+        case .nonText(let role):
+            popup.show(
+                at: point,
+                text: """
+                当前位置不是文本。
+                — 角色门控（v0.2.1 debug）—
+                role: \(role)
+                """
+            )
+            return
+        case .failed(let reason):
+            popup.show(
+                at: point,
+                text: """
+                AX 角色探测失败。
+                — 角色门控（v0.2.1 debug）—
+                \(reason)
+                """
+            )
+            return
+        }
+
         guard let result = AXWordReader.resolve(at: point) else {
             popup.show(
                 at: point,
@@ -173,7 +206,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 当前位置不支持取词。
                 请把鼠标放在可选择的正文或输入框文字上再试。
 
-                — AX 诊断（v0.2 debug）—
+                — AX 诊断（v0.2.1 debug）—
                 \(AXWordReader.lastDiagnostic)
                 """
             )
@@ -200,7 +233,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         popup.update("正在解释：\(selection.word)\n\n")
         let lookupBox = PhraseLookupBox(result: result)
-        streamingTask = Task { [client, popup, phraseOverlay, lookupBox] in
+        streamingTask = Task { [client, popup, phraseOverlay, highlightOverlay, lookupBox] in
             do {
                 var output = ""
                 for try await delta in client.streamExplanation(selection: selection, config: config) {
@@ -220,13 +253,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     // Reveal the green phrase overlay as soon as the LLM gives us
                     // a usable source phrase, regardless of whether we'll later
                     // fall through to the translation-only fallback. Per-line
-                    // segments come from AXWordReader.phraseSegments.
+                    // segments come from AXWordReader.phraseSegments. Derive
+                    // the phrase font from the resolved word rect (or fall
+                    // back to nil → the overlay infers from segment height)
+                    // so the redraw doesn't pick up a stale ~70pt font when
+                    // a single segment happens to be tall (Issue 1 fix).
                     if !response.source.isEmpty {
                         let phrase = response.source
                         await MainActor.run {
                             let segs = lookupBox.result.phraseSegments(for: phrase)
                             if !segs.isEmpty {
-                                phraseOverlay.show(segments: segs, font: nil)
+                                let phraseFont: NSFont?
+                                if let wordRect = lookupBox.result.wordRect {
+                                    phraseFont = .systemFont(ofSize: max(11, wordRect.height * 0.78))
+                                } else {
+                                    phraseFont = nil
+                                }
+                                phraseOverlay.show(segments: segs, font: phraseFont)
+
+                                // Option B: yellow word box was missing
+                                // because `boundsForRange` returned nil for
+                                // the word range (soft-wrap / zero-width-
+                                // space / odd web glyph — Issue 3). When
+                                // green segments DID resolve, slice the
+                                // matching segment proportionally to land
+                                // yellow on the word visually.
+                                if lookupBox.result.wordRect == nil,
+                                   let derivedRect = Self.deriveWordRectFromSegments(
+                                    segments: segs,
+                                    word: selection.word
+                                   ) {
+                                    highlightOverlay.show(
+                                        word: selection.word,
+                                        font: nil,
+                                        at: derivedRect
+                                    )
+                                }
                             }
                         }
                     }
@@ -281,6 +343,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
         }
+    }
+
+    /// Belt-and-suspenders for Issue 3: when the AX layer failed to give us
+    /// a word rect (soft wrap, zero-width-space glyphs, odd web glyphs),
+    /// but the green phrase segments DID resolve — scan segments for the
+    /// one whose text contains `word`, then proportionally slice that
+    /// segment's rect to estimate where the word sits inside it. The
+    /// slicing is character-index-based so it's only an approximation,
+    /// but it lands yellow on the visual word in the common case where
+    /// path-3 in `resolveWordRect` would otherwise put yellow on a
+    /// neighboring glyph.
+    private static func deriveWordRectFromSegments(
+        segments: [AXWordReader.PhraseSegment],
+        word: String
+    ) -> NSRect? {
+        let needle = word.lowercased()
+        guard !needle.isEmpty else { return nil }
+        for seg in segments {
+            let hay = seg.text.lowercased()
+            guard let range = hay.range(of: needle) else { continue }
+            let totalCount = hay.count
+            guard totalCount > 0 else { continue }
+            let startIdx = hay.distance(from: hay.startIndex, to: range.lowerBound)
+            let endIdx = hay.distance(from: hay.startIndex, to: range.upperBound)
+            let relStart = CGFloat(startIdx) / CGFloat(totalCount)
+            let relEnd = CGFloat(endIdx) / CGFloat(totalCount)
+            return NSRect(
+                x: seg.rect.minX + seg.rect.width * relStart,
+                y: seg.rect.minY,
+                width: seg.rect.width * (relEnd - relStart),
+                height: seg.rect.height
+            )
+        }
+        return nil
     }
 
     private static func friendlyErrorMessage(for error: Error) -> String {

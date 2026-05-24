@@ -47,15 +47,30 @@ final class TrackpadTapMonitor: @unchecked Sendable {
         stop()
     }
 
-    private func process(contactCount: Int32, timestamp: TimeInterval) {
+    private func process(
+        contactCount: Int32,
+        timestamp: TimeInterval,
+        centroidX: Float,
+        centroidY: Float
+    ) {
         queue.async { [weak self] in
-            self?.detector.process(contactCount: contactCount, timestamp: timestamp)
+            self?.detector.process(
+                contactCount: contactCount,
+                timestamp: timestamp,
+                centroidX: centroidX,
+                centroidY: centroidY
+            )
         }
     }
 
-    private static let touchCallback: MSTouchFrameCallback = { contactCount, timestamp, _, context in
+    private static let touchCallback: MSTouchFrameCallback = { contactCount, timestamp, _, centroidX, centroidY, context in
         guard let context else { return }
         let monitor = Unmanaged<TrackpadTapMonitor>.fromOpaque(context).takeUnretainedValue()
-        monitor.process(contactCount: contactCount, timestamp: timestamp)
+        monitor.process(
+            contactCount: contactCount,
+            timestamp: timestamp,
+            centroidX: centroidX,
+            centroidY: centroidY
+        )
     }
 }

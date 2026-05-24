@@ -7,7 +7,8 @@
 extern "C" {
 #endif
 
-typedef void (*MSTouchFrameCallback)(int contactCount, double timestamp, int frame, void *context);
+typedef void (*MSTouchFrameCallback)(int contactCount, double timestamp, int frame,
+                                     float centroidX, float centroidY, void *context);
 
 bool MSTrackpadStart(MSTouchFrameCallback callback, void *context, char *errorBuffer, int errorBufferLength);
 void MSTrackpadStop(void);

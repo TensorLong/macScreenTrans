@@ -13,6 +13,37 @@ typedef void (*MTUnregisterContactFrameCallbackFunction)(MTDeviceRef device, MTC
 typedef void (*MTDeviceStartFunction)(MTDeviceRef device, int flags);
 typedef void (*MTDeviceStopFunction)(MTDeviceRef device);
 
+// MultitouchSupport private per-finger payload (reverse-engineered, stable across
+// macOS versions used by OpenMultitouchSupport, mac-gesture, Hammerspoon, etc.).
+// We only need normalizedVector.{x,y}; the rest of the struct exists to keep the
+// memory layout correct when indexing into the array MultitouchSupport hands us.
+typedef struct {
+    float x;
+    float y;
+    float vx;
+    float vy;
+} MSMTPoint;
+
+typedef struct {
+    int frame;
+    double timestamp;
+    int identifier;
+    int state;
+    int finger;
+    int hand;
+    MSMTPoint normalizedVector;
+    MSMTPoint absoluteVector;
+    int unknown1[2];
+    float size;
+    int unknown2;
+    float angle;
+    float majorAxis;
+    float minorAxis;
+    MSMTPoint mm;
+    int unknown3[2];
+    float zDensity;
+} MSMTTouch;
+
 static void *gFramework = NULL;
 static CFMutableArrayRef gDevices = NULL;
 static MSTouchFrameCallback gCallback = NULL;
@@ -29,9 +60,23 @@ static void writeError(char *buffer, int length, const char *message) {
 
 static int touchFrameCallback(MTDeviceRef device, void *data, int contactCount, double timestamp, int frame) {
     (void)device;
-    (void)data;
+
+    float centroidX = 0.0f;
+    float centroidY = 0.0f;
+    if (contactCount > 0 && data != NULL) {
+        const MSMTTouch *touches = (const MSMTTouch *)data;
+        float sumX = 0.0f;
+        float sumY = 0.0f;
+        for (int i = 0; i < contactCount; i++) {
+            sumX += touches[i].normalizedVector.x;
+            sumY += touches[i].normalizedVector.y;
+        }
+        centroidX = sumX / (float)contactCount;
+        centroidY = sumY / (float)contactCount;
+    }
+
     if (gCallback != NULL) {
-        gCallback(contactCount, timestamp, frame, gContext);
+        gCallback(contactCount, timestamp, frame, centroidX, centroidY, gContext);
     }
     return 0;
 }

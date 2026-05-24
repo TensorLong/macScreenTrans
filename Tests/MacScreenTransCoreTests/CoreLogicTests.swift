@@ -270,8 +270,8 @@ import Testing
     var recognized = false
     var detector = ThreeFingerTapDetector { recognized = true }
 
-    detector.process(contactCount: 3, timestamp: 10.0)
-    detector.process(contactCount: 0, timestamp: 10.12)
+    detector.process(contactCount: 3, timestamp: 10.0, centroidX: 0.5, centroidY: 0.5)
+    detector.process(contactCount: 0, timestamp: 10.12, centroidX: 0.5, centroidY: 0.5)
 
     #expect(recognized)
 }
@@ -280,8 +280,8 @@ import Testing
     var recognized = false
     var detector = ThreeFingerTapDetector { recognized = true }
 
-    detector.process(contactCount: 3, timestamp: 10.0)
-    detector.process(contactCount: 0, timestamp: 10.9)
+    detector.process(contactCount: 3, timestamp: 10.0, centroidX: 0.5, centroidY: 0.5)
+    detector.process(contactCount: 0, timestamp: 10.9, centroidX: 0.5, centroidY: 0.5)
 
     #expect(!recognized)
 }
@@ -290,12 +290,12 @@ import Testing
     var count = 0
     var detector = ThreeFingerTapDetector { count += 1 }
 
-    detector.process(contactCount: 3, timestamp: 10.0)
-    detector.process(contactCount: 0, timestamp: 10.12)
-    detector.process(contactCount: 3, timestamp: 10.2)
-    detector.process(contactCount: 0, timestamp: 10.28)
-    detector.process(contactCount: 3, timestamp: 10.7)
-    detector.process(contactCount: 0, timestamp: 10.78)
+    detector.process(contactCount: 3, timestamp: 10.0, centroidX: 0.5, centroidY: 0.5)
+    detector.process(contactCount: 0, timestamp: 10.12, centroidX: 0.5, centroidY: 0.5)
+    detector.process(contactCount: 3, timestamp: 10.2, centroidX: 0.5, centroidY: 0.5)
+    detector.process(contactCount: 0, timestamp: 10.28, centroidX: 0.5, centroidY: 0.5)
+    detector.process(contactCount: 3, timestamp: 10.7, centroidX: 0.5, centroidY: 0.5)
+    detector.process(contactCount: 0, timestamp: 10.78, centroidX: 0.5, centroidY: 0.5)
 
     #expect(count == 2)
 }
@@ -304,10 +304,10 @@ import Testing
     var count = 0
     var detector = ThreeFingerTapDetector { count += 1 }
 
-    detector.process(contactCount: 3, timestamp: 10.0)
-    detector.process(contactCount: 2, timestamp: 10.1)
-    detector.process(contactCount: 3, timestamp: 10.5)
-    detector.process(contactCount: 4, timestamp: 10.6)
+    detector.process(contactCount: 3, timestamp: 10.0, centroidX: 0.5, centroidY: 0.5)
+    detector.process(contactCount: 2, timestamp: 10.1, centroidX: 0.5, centroidY: 0.5)
+    detector.process(contactCount: 3, timestamp: 10.5, centroidX: 0.5, centroidY: 0.5)
+    detector.process(contactCount: 4, timestamp: 10.6, centroidX: 0.5, centroidY: 0.5)
 
     #expect(count == 0)
 }
@@ -318,12 +318,12 @@ import Testing
     var recognized = false
     var detector = ThreeFingerTapDetector { recognized = true }
 
-    detector.process(contactCount: 1, timestamp: 10.00)
-    detector.process(contactCount: 2, timestamp: 10.01)
-    detector.process(contactCount: 3, timestamp: 10.02)
-    detector.process(contactCount: 2, timestamp: 10.10)
-    detector.process(contactCount: 1, timestamp: 10.11)
-    detector.process(contactCount: 0, timestamp: 10.12)
+    detector.process(contactCount: 1, timestamp: 10.00, centroidX: 0.5, centroidY: 0.5)
+    detector.process(contactCount: 2, timestamp: 10.01, centroidX: 0.5, centroidY: 0.5)
+    detector.process(contactCount: 3, timestamp: 10.02, centroidX: 0.5, centroidY: 0.5)
+    detector.process(contactCount: 2, timestamp: 10.10, centroidX: 0.5, centroidY: 0.5)
+    detector.process(contactCount: 1, timestamp: 10.11, centroidX: 0.5, centroidY: 0.5)
+    detector.process(contactCount: 0, timestamp: 10.12, centroidX: 0.5, centroidY: 0.5)
 
     #expect(recognized)
 }
@@ -332,12 +332,12 @@ import Testing
     var count = 0
     var detector = ThreeFingerTapDetector { count += 1 }
 
-    detector.process(contactCount: 1, timestamp: 10.00)
-    detector.process(contactCount: 2, timestamp: 10.01)
-    detector.process(contactCount: 3, timestamp: 10.02)
-    detector.process(contactCount: 4, timestamp: 10.03)
-    detector.process(contactCount: 3, timestamp: 10.10)
-    detector.process(contactCount: 0, timestamp: 10.12)
+    detector.process(contactCount: 1, timestamp: 10.00, centroidX: 0.5, centroidY: 0.5)
+    detector.process(contactCount: 2, timestamp: 10.01, centroidX: 0.5, centroidY: 0.5)
+    detector.process(contactCount: 3, timestamp: 10.02, centroidX: 0.5, centroidY: 0.5)
+    detector.process(contactCount: 4, timestamp: 10.03, centroidX: 0.5, centroidY: 0.5)
+    detector.process(contactCount: 3, timestamp: 10.10, centroidX: 0.5, centroidY: 0.5)
+    detector.process(contactCount: 0, timestamp: 10.12, centroidX: 0.5, centroidY: 0.5)
 
     #expect(count == 0)
 }
@@ -346,12 +346,87 @@ import Testing
     var count = 0
     var detector = ThreeFingerTapDetector { count += 1 }
 
-    detector.process(contactCount: 1, timestamp: 10.00)
-    detector.process(contactCount: 2, timestamp: 10.02)
-    detector.process(contactCount: 1, timestamp: 10.10)
-    detector.process(contactCount: 0, timestamp: 10.12)
+    detector.process(contactCount: 1, timestamp: 10.00, centroidX: 0.5, centroidY: 0.5)
+    detector.process(contactCount: 2, timestamp: 10.02, centroidX: 0.5, centroidY: 0.5)
+    detector.process(contactCount: 1, timestamp: 10.10, centroidX: 0.5, centroidY: 0.5)
+    detector.process(contactCount: 0, timestamp: 10.12, centroidX: 0.5, centroidY: 0.5)
 
     #expect(count == 0)
+}
+
+@Test func threeFingerTapDetectorRejectsThreeFingerSwipeByDrift() {
+    // System three-finger swipe (Mission Control, desktop switching): the
+    // centroid drifts a long way across the trackpad. Drift > 0.05 must reject.
+    var recognized = false
+    var detector = ThreeFingerTapDetector { recognized = true }
+
+    detector.process(contactCount: 3, timestamp: 10.00, centroidX: 0.5, centroidY: 0.5)
+    detector.process(contactCount: 3, timestamp: 10.05, centroidX: 0.6, centroidY: 0.5)
+    detector.process(contactCount: 3, timestamp: 10.15, centroidX: 0.7, centroidY: 0.5)
+    detector.process(contactCount: 0, timestamp: 10.18, centroidX: 0.7, centroidY: 0.5)
+
+    #expect(!recognized)
+}
+
+@Test func threeFingerTapDetectorRejectsSubMinimumDurationJitter() {
+    // 10ms total — sensor jitter, not a human tap. Below 20ms floor.
+    var recognized = false
+    var detector = ThreeFingerTapDetector { recognized = true }
+
+    detector.process(contactCount: 3, timestamp: 10.000, centroidX: 0.5, centroidY: 0.5)
+    detector.process(contactCount: 0, timestamp: 10.010, centroidX: 0.5, centroidY: 0.5)
+
+    #expect(!recognized)
+}
+
+@Test func threeFingerTapDetectorAcceptsStationaryTap() {
+    // A real tap: drift well under 0.05, duration well under ceiling.
+    var recognized = false
+    var detector = ThreeFingerTapDetector { recognized = true }
+
+    detector.process(contactCount: 3, timestamp: 10.00, centroidX: 0.5, centroidY: 0.5)
+    detector.process(contactCount: 3, timestamp: 10.05, centroidX: 0.501, centroidY: 0.502)
+    detector.process(contactCount: 0, timestamp: 10.10, centroidX: 0.501, centroidY: 0.502)
+
+    #expect(recognized)
+}
+
+@Test func threeFingerTapDetectorAcceptsDriftJustBelowThreshold() {
+    // Drift = 0.049 (just under the 0.05 ceiling) — should fire.
+    var recognized = false
+    var detector = ThreeFingerTapDetector { recognized = true }
+
+    detector.process(contactCount: 3, timestamp: 10.00, centroidX: 0.5, centroidY: 0.5)
+    detector.process(contactCount: 3, timestamp: 10.05, centroidX: 0.549, centroidY: 0.5)
+    detector.process(contactCount: 0, timestamp: 10.10, centroidX: 0.549, centroidY: 0.5)
+
+    #expect(recognized)
+}
+
+@Test func threeFingerTapDetectorRejectsDriftJustAboveThreshold() {
+    // Drift = 0.051 (just over the 0.05 ceiling) — should reject.
+    var recognized = false
+    var detector = ThreeFingerTapDetector { recognized = true }
+
+    detector.process(contactCount: 3, timestamp: 10.00, centroidX: 0.5, centroidY: 0.5)
+    detector.process(contactCount: 3, timestamp: 10.05, centroidX: 0.551, centroidY: 0.5)
+    detector.process(contactCount: 0, timestamp: 10.10, centroidX: 0.551, centroidY: 0.5)
+
+    #expect(!recognized)
+}
+
+@Test func threeFingerTapDetectorTracksPeakDriftEvenIfFingersReturn() {
+    // Centroid drifts to 0.6 mid-touch then returns to start. The detector
+    // should record max drift = 0.1 across the lifetime, not final drift = 0.
+    var recognized = false
+    var detector = ThreeFingerTapDetector { recognized = true }
+
+    detector.process(contactCount: 3, timestamp: 10.00, centroidX: 0.5, centroidY: 0.5)
+    detector.process(contactCount: 3, timestamp: 10.05, centroidX: 0.6, centroidY: 0.5)
+    detector.process(contactCount: 3, timestamp: 10.10, centroidX: 0.5, centroidY: 0.5)
+    detector.process(contactCount: 0, timestamp: 10.15, centroidX: 0.5, centroidY: 0.5)
+
+    #expect(!recognized)
 }
 
 @Test func screenCoordinateConverterFlipsQuartzRectToAppKit() {
