@@ -51,14 +51,10 @@ final class FloatingTranslationWindowController {
         bubbleBackground = BubbleBackgroundView(frame: initialFrame)
         panel.contentView = bubbleBackground
 
-        let visualEffect = NSVisualEffectView()
-        visualEffect.material = .popover
-        visualEffect.blendingMode = .behindWindow
-        visualEffect.state = .active
-        visualEffect.wantsLayer = true
-        visualEffect.translatesAutoresizingMaskIntoConstraints = false
-        bubbleBackground.addSubview(visualEffect)
-        bubbleBackground.visualEffectView = visualEffect
+        let opaqueFill = OpaqueBubbleFillView()
+        opaqueFill.translatesAutoresizingMaskIntoConstraints = false
+        bubbleBackground.addSubview(opaqueFill)
+        bubbleBackground.fillView = opaqueFill
 
         let contentStack = NSStackView()
         contentStack.orientation = .vertical
@@ -85,7 +81,7 @@ final class FloatingTranslationWindowController {
         scrollView.translatesAutoresizingMaskIntoConstraints = false
         scrollView.hasVerticalScroller = true
         scrollView.drawsBackground = true
-        scrollView.backgroundColor = NSColor.controlBackgroundColor.withAlphaComponent(0.42)
+        scrollView.backgroundColor = NSColor.textBackgroundColor
         scrollView.borderType = .noBorder
         scrollView.wantsLayer = true
         scrollView.layer?.cornerRadius = 10
@@ -118,7 +114,7 @@ final class FloatingTranslationWindowController {
         scrollView.heightAnchor.constraint(greaterThanOrEqualToConstant: 96).isActive = true
 
         bubbleBackground.applyContentConstraints(
-            visualEffect: visualEffect,
+            fillView: opaqueFill,
             contentStack: contentStack,
             inset: Self.contentInset,
             tailHeight: Self.tailHeight
@@ -403,9 +399,9 @@ private struct ParsedPopupText {
 }
 
 /// Hosts the bubble shape: a rounded rect body plus an optional triangular
-/// tail on either top or bottom edge. The shape is applied as a layer mask
-/// to the panel's visual-effect view so the system blur, shadow, and
-/// content all conform to it.
+/// tail on either top or bottom edge. The bubble path is drawn (solid fill
+/// + thin stroke) by the embedded `OpaqueBubbleFillView`, matching native
+/// AppKit popover opacity instead of the previous translucent blur.
 private final class BubbleBackgroundView: NSView {
     struct TailConfig: Equatable {
         enum Edge { case top, bottom }
@@ -418,11 +414,14 @@ private final class BubbleBackgroundView: NSView {
 
     var tailConfig: TailConfig? {
         didSet {
-            if tailConfig != oldValue { needsLayout = true }
+            if tailConfig != oldValue {
+                needsLayout = true
+                fillView?.tailConfig = tailConfig
+            }
         }
     }
 
-    weak var visualEffectView: NSVisualEffectView?
+    weak var fillView: OpaqueBubbleFillView?
     weak var contentStack: NSStackView?
 
     private var contentTopConstraint: NSLayoutConstraint?
@@ -433,7 +432,7 @@ private final class BubbleBackgroundView: NSView {
     override var isFlipped: Bool { false }
 
     func applyContentConstraints(
-        visualEffect: NSVisualEffectView,
+        fillView: OpaqueBubbleFillView,
         contentStack: NSStackView,
         inset: CGFloat,
         tailHeight: CGFloat
@@ -441,18 +440,18 @@ private final class BubbleBackgroundView: NSView {
         self.baseInset = inset
         self.baseTailHeight = tailHeight
 
-        // visualEffect fills the whole panel. The bubble path masks it to
-        // the speech-bubble shape (body + tail).
+        // fillView fills the whole panel and draws the opaque bubble shape
+        // (body + tail). The window's shadow follows the masked layer.
         let csTop = contentStack.topAnchor.constraint(equalTo: topAnchor, constant: inset)
         let csBottom = contentStack.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -inset)
         contentTopConstraint = csTop
         contentBottomConstraint = csBottom
 
         NSLayoutConstraint.activate([
-            visualEffect.leadingAnchor.constraint(equalTo: leadingAnchor),
-            visualEffect.trailingAnchor.constraint(equalTo: trailingAnchor),
-            visualEffect.topAnchor.constraint(equalTo: topAnchor),
-            visualEffect.bottomAnchor.constraint(equalTo: bottomAnchor),
+            fillView.leadingAnchor.constraint(equalTo: leadingAnchor),
+            fillView.trailingAnchor.constraint(equalTo: trailingAnchor),
+            fillView.topAnchor.constraint(equalTo: topAnchor),
+            fillView.bottomAnchor.constraint(equalTo: bottomAnchor),
             contentStack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: inset),
             contentStack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -inset),
             csTop,
@@ -489,19 +488,15 @@ private final class BubbleBackgroundView: NSView {
     }
 
     private func applyMaskAndShadow() {
-        guard let visualEffectView else { return }
-        visualEffectView.wantsLayer = true
-        let layer = visualEffectView.layer ?? CALayer()
-        visualEffectView.layer = layer
-
-        let path = bubblePath(in: visualEffectView.bounds)
-        let maskLayer = (layer.mask as? CAShapeLayer) ?? CAShapeLayer()
-        maskLayer.path = path
-        maskLayer.frame = visualEffectView.bounds
-        layer.mask = maskLayer
+        // The OpaqueBubbleFillView redraws itself in response to bounds &
+        // tailConfig changes; nothing further to mask at this level. The
+        // window's drop shadow tracks the fill view's opaque alpha shape
+        // via the layer mask installed in OpaqueBubbleFillView.layout().
+        fillView?.needsDisplay = true
+        fillView?.needsLayout = true
     }
 
-    private func bubblePath(in rect: NSRect) -> CGPath {
+    fileprivate func bubblePath(in rect: NSRect) -> CGPath {
         let path = CGMutablePath()
         let radius = tailConfig?.cornerRadius ?? 14
 
@@ -611,6 +606,93 @@ private final class BubbleBackgroundView: NSView {
             path.closeSubpath()
         }
 
+        return path
+    }
+}
+
+/// Solid-fill bubble background. Draws the speech-bubble path with an
+/// opaque system "elevated" color plus a hairline border. Replaces the
+/// prior NSVisualEffectView so underlying app content cannot bleed
+/// through the popup body, matching the look of Apple's native popovers
+/// (e.g. Dictionary's Look Up window) at rest.
+fileprivate final class OpaqueBubbleFillView: NSView {
+    var tailConfig: BubbleBackgroundView.TailConfig? {
+        didSet {
+            if tailConfig != oldValue {
+                needsDisplay = true
+                needsLayout = true
+            }
+        }
+    }
+
+    override var isFlipped: Bool { false }
+    override var isOpaque: Bool { false }
+    override var wantsUpdateLayer: Bool { false }
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        wantsLayer = true
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        needsDisplay = true
+    }
+
+    override func layout() {
+        super.layout()
+        // The window's drop shadow follows the layer's alpha; mask the
+        // backing layer to the bubble path so the shadow conforms to the
+        // tail rather than the bounding rect.
+        let layer = self.layer ?? CALayer()
+        self.layer = layer
+        let path = bubblePath(in: bounds)
+        let maskLayer = (layer.mask as? CAShapeLayer) ?? CAShapeLayer()
+        maskLayer.path = path
+        maskLayer.frame = bounds
+        layer.mask = maskLayer
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard let context = NSGraphicsContext.current?.cgContext else { return }
+        let path = bubblePath(in: bounds)
+
+        context.saveGState()
+        defer { context.restoreGState() }
+
+        context.addPath(path)
+        context.setFillColor(fillColor().cgColor)
+        context.fillPath()
+
+        context.addPath(path)
+        context.setStrokeColor(strokeColor().cgColor)
+        context.setLineWidth(1)
+        context.strokePath()
+    }
+
+    private func fillColor() -> NSColor {
+        // Use `windowBackgroundColor` rather than `controlBackgroundColor`
+        // — it tracks the system popover/window chrome (slightly tinted
+        // off-white in light mode, near-black in dark mode), matching the
+        // Look Up popover's body.
+        NSColor.windowBackgroundColor
+    }
+
+    private func strokeColor() -> NSColor {
+        NSColor.separatorColor
+    }
+
+    private func bubblePath(in rect: NSRect) -> CGPath {
+        if let parent = superview as? BubbleBackgroundView {
+            return parent.bubblePath(in: rect)
+        }
+        let path = CGMutablePath()
+        path.addRoundedRect(in: rect, cornerWidth: 14, cornerHeight: 14)
         return path
     }
 }
