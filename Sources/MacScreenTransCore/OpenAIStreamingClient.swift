@@ -54,7 +54,7 @@ public final class OpenAIStreamingClient: Sendable {
 
         let messages = PromptBuilder.messages(selection: selection, config: config)
         let body: [String: Any] = [
-            "model": config.model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "gpt-4o-mini" : config.model,
+            "model": config.model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? TranslationConfig.defaultModel : config.model,
             "messages": messages.map { ["role": $0.role, "content": $0.content] },
             "stream": true,
             "temperature": 0.0

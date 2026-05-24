@@ -1,7 +1,7 @@
 import Foundation
 
 public enum EndpointResolver {
-    public static let defaultBaseURL = "https://api.openai.com"
+    public static let defaultBaseURL = "https://openrouter.ai/api/v1"
     public static let chatCompletionsPath = "v1/chat/completions"
 
     public static func chatCompletionsURL(baseURL: String?) -> URL? {

@@ -19,4 +19,13 @@ enum PermissionHelper {
         }
         NSWorkspace.shared.open(url)
     }
+
+    static func openTrackpadSettings() {
+        guard let url = URL(
+            string: "x-apple.systempreferences:com.apple.Trackpad-Settings.extension"
+        ) else {
+            return
+        }
+        NSWorkspace.shared.open(url)
+    }
 }

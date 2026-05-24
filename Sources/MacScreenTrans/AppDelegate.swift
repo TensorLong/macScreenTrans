@@ -5,8 +5,9 @@ import MacScreenTransCore
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let trackpadMonitor = TrackpadTapMonitor()
     private let client = OpenAIStreamingClient()
-    private let translateNotificationName = Notification.Name("com.longmac.MacScreenTrans.translateUnderCursor")
     private var statusItem: NSStatusItem?
+    private let statusMenu = NSMenu()
+    private var menuBarBadge: MenuBarBadgeWindowController?
     private var settingsWindow: SettingsWindowController?
     private var streamingTask: Task<Void, Never>?
     private lazy var popup = FloatingTranslationWindowController()
@@ -15,15 +16,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         AppConfiguration.bootstrapDefaults()
         configureApplicationMenu()
         configureStatusItem()
+        menuBarBadge = MenuBarBadgeWindowController(menu: statusMenu)
+        menuBarBadge?.show()
 
-        settingsWindow = SettingsWindowController { [weak self] in
-            self?.selfCheckReport() ?? "Self-check unavailable"
-        }
-        DistributedNotificationCenter.default().addObserver(
-            self,
-            selector: #selector(translateUnderCursor),
-            name: translateNotificationName,
-            object: nil
+        settingsWindow = SettingsWindowController(
+            onSelfCheck: { [weak self] in
+                self?.selfCheckReport() ?? "Self-check unavailable"
+            },
+            onTranslateUnderCursor: { [weak self] in
+                self?.handleThreeFingerTap()
+            }
         )
 
         trackpadMonitor.onTap = { [weak self] in
@@ -46,26 +48,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         streamingTask?.cancel()
-        DistributedNotificationCenter.default().removeObserver(self, name: translateNotificationName, object: nil)
         trackpadMonitor.stop()
     }
 
     private func configureStatusItem() {
-        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-        statusItem?.button?.title = "译"
-        statusItem?.button?.toolTip = "MacScreenTrans"
-
-        let menu = NSMenu()
-        menu.addItem(menuItem("Translate Under Cursor", action: #selector(translateUnderCursor), keyEquivalent: ""))
-        menu.addItem(.separator())
-        menu.addItem(menuItem("Settings...", action: #selector(showSettings), keyEquivalent: ","))
-        menu.addItem(menuItem("Permission Self-Check", action: #selector(runSelfCheck), keyEquivalent: ""))
-        menu.addItem(.separator())
-        menu.addItem(menuItem("Start Listening", action: #selector(startListening), keyEquivalent: ""))
-        menu.addItem(menuItem("Stop Listening", action: #selector(stopListening), keyEquivalent: ""))
-        menu.addItem(.separator())
-        menu.addItem(menuItem("Quit", action: #selector(quit), keyEquivalent: "q"))
-        statusItem?.menu = menu
+        statusItem = NSStatusBar.system.statusItem(withLength: 92)
+        statusItem?.button?.image = StatusBarIcon.makeBadge()
+        statusItem?.button?.title = " 译 Trans"
+        statusItem?.button?.imagePosition = .imageLeft
+        statusItem?.button?.font = .systemFont(ofSize: 13, weight: .semibold)
+        statusItem?.button?.toolTip = "MacScreenTrans - 点击打开设置和翻译菜单"
+        statusItem?.button?.setAccessibilityLabel("MacScreenTrans menu bar item")
+        statusItem?.button?.setAccessibilityHelp("菜单栏应显示为蓝色译图标和 Trans 文字")
+        statusMenu.delegate = self
+        rebuildStatusMenu()
+        statusItem?.menu = statusMenu
     }
 
     private func configureApplicationMenu() {
@@ -75,9 +72,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         mainMenu.addItem(appMenuItem)
 
         let appMenu = NSMenu()
-        appMenu.addItem(menuItem("Settings...", action: #selector(showSettings), keyEquivalent: ","))
+        appMenu.addItem(menuItem("翻译光标下文本", action: #selector(translateUnderCursor), keyEquivalent: "t"))
+        appMenu.addItem(menuItem("权限自检", action: #selector(runSelfCheck), keyEquivalent: ""))
         appMenu.addItem(.separator())
-        appMenu.addItem(menuItem("Quit MacScreenTrans", action: #selector(quit), keyEquivalent: "q"))
+        appMenu.addItem(menuItem("设置...", action: #selector(showSettings), keyEquivalent: ","))
+        appMenu.addItem(.separator())
+        appMenu.addItem(menuItem("退出 MacScreenTrans", action: #selector(quit), keyEquivalent: "q"))
         appMenuItem.submenu = appMenu
 
         NSApp.mainMenu = mainMenu
@@ -87,6 +87,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let item = NSMenuItem(title: title, action: action, keyEquivalent: keyEquivalent)
         item.target = self
         return item
+    }
+
+    private func disabledMenuItem(_ title: String) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        item.isEnabled = false
+        return item
+    }
+
+    private func rebuildStatusMenu() {
+        statusMenu.removeAllItems()
+        statusMenu.addItem(disabledMenuItem(trackpadMonitor.isRunning ? "监听：开启" : "监听：关闭"))
+        statusMenu.addItem(menuItem("翻译光标下文本", action: #selector(translateUnderCursor), keyEquivalent: ""))
+        statusMenu.addItem(.separator())
+        statusMenu.addItem(menuItem("设置...", action: #selector(showSettings), keyEquivalent: ","))
+        statusMenu.addItem(menuItem("权限自检", action: #selector(runSelfCheck), keyEquivalent: ""))
+        statusMenu.addItem(.separator())
+
+        if trackpadMonitor.isRunning {
+            statusMenu.addItem(menuItem("停止监听", action: #selector(stopListening), keyEquivalent: ""))
+        } else {
+            statusMenu.addItem(menuItem("开始监听", action: #selector(startListening), keyEquivalent: ""))
+        }
+
+        statusMenu.addItem(.separator())
+        statusMenu.addItem(menuItem("退出", action: #selector(quit), keyEquivalent: "q"))
     }
 
     @objc private func showSettings() {
@@ -103,10 +128,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func startListening() {
         trackpadMonitor.start()
+        rebuildStatusMenu()
     }
 
     @objc private func stopListening() {
         trackpadMonitor.stop()
+        rebuildStatusMenu()
     }
 
     @objc private func quit() {
@@ -120,12 +147,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         guard PermissionHelper.accessibilityTrusted else {
             PermissionHelper.promptForAccessibility()
-            popup.update("需要辅助功能权限后才能通过 Accessibility API 取词。")
+            popup.update("需要辅助功能权限。\n请打开设置页，点击“打开辅助功能设置”，允许 MacScreenTrans 后重启应用。")
             return
         }
 
         guard let selection = AXWordReader.selection(at: point) else {
-            popup.update("当前位置不支持取词")
+            popup.update("当前位置不支持取词。\n请把鼠标放在可选择的正文或输入框文字上再试。图片、部分 PDF 或自绘界面可能不支持。")
             return
         }
 
@@ -143,7 +170,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 for try await delta in client.streamExplanation(selection: selection, config: config) {
                     output += delta
                     await MainActor.run {
-                        popup.update(output.isEmpty ? "等待模型输出..." : SenseGroupResponseRenderer.displayText(for: output))
+                        popup.update(SenseGroupResponseRenderer.displayText(for: output.isEmpty ? "正在识别意群..." : output))
                     }
                 }
                 if output.isEmpty {
@@ -171,13 +198,57 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                             popup.update("意群: \(response.source)\n释义: \(target.isEmpty ? "正在补译..." : target)")
                         }
                     }
+                    if fallbackOutput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        await MainActor.run {
+                            popup.update("意群: \(response.source)\n释义: 模型没有返回译文，请重试。")
+                        }
+                    }
+                } else if SenseGroupResponseRenderer.isLikelyStructuredResponse(output),
+                          SenseGroupResponseRenderer.response(for: output) == nil {
+                    await MainActor.run {
+                        popup.update("模型返回格式不完整。\n请在设置页点击“恢复默认”后重试，或换一个模型。")
+                    }
+                } else if SenseGroupResponseRenderer.response(for: output) == nil {
+                    await MainActor.run {
+                        popup.update("模型没有按要求返回译文 JSON。\n请在设置页点击“恢复默认”后重试，或换一个模型。")
+                    }
                 }
             } catch is CancellationError {
             } catch {
                 await MainActor.run {
-                    popup.update("请求失败：\(error.localizedDescription)")
+                    popup.update(Self.friendlyErrorMessage(for: error))
                 }
             }
+        }
+    }
+
+    private static func friendlyErrorMessage(for error: Error) -> String {
+        guard let streamingError = error as? OpenAIStreamingError else {
+            return "请求失败：\(error.localizedDescription)"
+        }
+
+        switch streamingError {
+        case .missingAPIKey:
+            return "缺少 API Key。\n请在设置页填写 OpenRouter 或 OpenAI-compatible API key。"
+        case .invalidEndpoint:
+            return "Endpoint URL 无效。\n请检查设置页中的 API URL，例如 https://openrouter.ai/api/v1。"
+        case .invalidHTTPResponse:
+            return "API 返回了无效响应。\n请稍后重试或检查 Endpoint。"
+        case let .httpFailure(status, _):
+            let hint: String
+            switch status {
+            case 400:
+                hint = "请求参数或模型名不兼容。"
+            case 401, 403:
+                hint = "API Key 无效或没有权限。"
+            case 429:
+                hint = "请求过于频繁或额度不足。"
+            case 500...599:
+                hint = "服务端暂时不可用。"
+            default:
+                hint = "HTTP \(status)。"
+            }
+            return "请求失败：\(hint)\n请检查设置页中的服务地址、API Key 和模型名。"
         }
     }
 
@@ -187,16 +258,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let apiKeyOK = !config.apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         let modelOK = !config.model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         let trackpadStatus = trackpadMonitor.isRunning
-            ? "running"
-            : "stopped\(trackpadMonitor.lastError.map { ": \($0)" } ?? "")"
+            ? "运行中"
+            : "未运行\(trackpadMonitor.lastError.map { ": \($0)" } ?? "")"
 
         return """
-        Accessibility: \(PermissionHelper.accessibilityTrusted ? "trusted" : "not trusted")
-        Trackpad tap monitor: \(trackpadStatus)
-        Endpoint: \(endpointOK ? "ok" : "invalid")
-        API key: \(apiKeyOK ? "configured" : "missing")
-        Model: \(modelOK ? "configured" : "missing")
-        Target language: \(config.targetLanguage)
+        辅助功能权限：\(PermissionHelper.accessibilityTrusted ? "已授权" : "未授权")
+        三指轻点监听：\(trackpadStatus)
+        Endpoint：\(endpointOK ? "正常" : "无效")
+        API Key：\(apiKeyOK ? "已配置" : "缺失")
+        Model：\(modelOK ? "已配置" : "缺失")
+        目标语言：\(config.targetLanguage)
         """
+    }
+}
+
+extension AppDelegate: NSMenuDelegate {
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        rebuildStatusMenu()
     }
 }

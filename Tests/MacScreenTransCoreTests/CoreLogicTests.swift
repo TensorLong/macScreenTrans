@@ -72,10 +72,16 @@ import Testing
     #expect(SenseGroupResponseRenderer.displayText(for: raw) == "意群: given a sentence\n释义: 给定一个句子")
 }
 
-@Test func senseGroupRendererKeepsPartialStreamVisible() {
+@Test func senseGroupRendererHidesPartialJSONStream() {
     let raw = "{\"source_chunk\":\"an"
 
-    #expect(SenseGroupResponseRenderer.displayText(for: raw) == raw)
+    #expect(SenseGroupResponseRenderer.displayText(for: raw) == "正在识别意群...")
+}
+
+@Test func senseGroupRendererShowsPendingTargetForSourceOnlyJSON() {
+    let raw = "{\"source_chunk\":\"given a sentence\"}"
+
+    #expect(SenseGroupResponseRenderer.displayText(for: raw) == "意群: given a sentence\n释义: 正在补译...")
 }
 
 @Test func promptBuilderUsesConfiguredTemplateAndPayload() {

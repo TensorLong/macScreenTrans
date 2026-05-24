@@ -10,15 +10,24 @@ enum DefaultsKey {
 }
 
 enum AppConfiguration {
+    static let defaultModel = TranslationConfig.defaultModel
+
     static func bootstrapDefaults() {
         let defaults = UserDefaults.standard
         defaults.register(defaults: [
             DefaultsKey.endpoint: EndpointResolver.defaultBaseURL,
             DefaultsKey.apiKey: "",
-            DefaultsKey.model: "gpt-4o-mini",
+            DefaultsKey.model: defaultModel,
             DefaultsKey.targetLanguage: "zh",
             DefaultsKey.promptTemplate: PromptBuilder.defaultPromptTemplate
         ])
+
+        if defaults.string(forKey: DefaultsKey.endpoint) == "https://api.openai.com",
+           defaults.string(forKey: DefaultsKey.apiKey)?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false,
+           defaults.string(forKey: DefaultsKey.model) == "gpt-4o-mini" {
+            defaults.set(EndpointResolver.defaultBaseURL, forKey: DefaultsKey.endpoint)
+            defaults.set(defaultModel, forKey: DefaultsKey.model)
+        }
     }
 
     static var current: TranslationConfig {
@@ -26,7 +35,7 @@ enum AppConfiguration {
         return TranslationConfig(
             endpoint: defaults.string(forKey: DefaultsKey.endpoint) ?? EndpointResolver.defaultBaseURL,
             apiKey: defaults.string(forKey: DefaultsKey.apiKey) ?? "",
-            model: defaults.string(forKey: DefaultsKey.model) ?? "gpt-4o-mini",
+            model: defaults.string(forKey: DefaultsKey.model) ?? defaultModel,
             targetLanguage: defaults.string(forKey: DefaultsKey.targetLanguage) ?? "zh",
             promptTemplate: defaults.string(forKey: DefaultsKey.promptTemplate) ?? PromptBuilder.defaultPromptTemplate
         )

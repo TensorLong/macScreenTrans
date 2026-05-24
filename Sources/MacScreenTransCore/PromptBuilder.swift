@@ -11,6 +11,8 @@ public struct ChatMessage: Codable, Equatable, Sendable {
 }
 
 public struct TranslationConfig: Equatable, Sendable {
+    public static let defaultModel = "openai/gpt-4o-mini"
+
     public var endpoint: String
     public var apiKey: String
     public var model: String
@@ -20,7 +22,7 @@ public struct TranslationConfig: Equatable, Sendable {
     public init(
         endpoint: String = EndpointResolver.defaultBaseURL,
         apiKey: String = "",
-        model: String = "gpt-4o-mini",
+        model: String = TranslationConfig.defaultModel,
         targetLanguage: String = "zh",
         promptTemplate: String = PromptBuilder.defaultPromptTemplate
     ) {

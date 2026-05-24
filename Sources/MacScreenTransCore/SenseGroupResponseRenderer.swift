@@ -33,6 +33,9 @@ public enum SenseGroupResponseRenderer {
 
     public static func displayText(for rawText: String) -> String {
         guard let response = response(for: rawText) else {
+            if isLikelyStructuredResponse(rawText) {
+                return "正在识别意群..."
+            }
             return rawText
         }
 
@@ -40,10 +43,22 @@ public enum SenseGroupResponseRenderer {
         if response.hasSource {
             lines.append("意群: \(response.source)")
         }
+        if response.hasSource && !response.hasTarget {
+            lines.append("释义: 正在补译...")
+        }
         if response.hasTarget {
             lines.append("释义: \(response.target)")
         }
-        return lines.joined(separator: "\n")
+        return lines.isEmpty ? "正在等待规范译文..." : lines.joined(separator: "\n")
+    }
+
+    public static func isLikelyStructuredResponse(_ rawText: String) -> Bool {
+        let trimmed = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.hasPrefix("{") ||
+            trimmed.hasPrefix("```") ||
+            trimmed.contains("\"source_chunk\"") ||
+            trimmed.contains("\"target_chunk\"") ||
+            trimmed.contains("\"translation\"")
     }
 
     private static func firstString(in object: [String: Any], keys: [String]) -> String {
@@ -71,4 +86,5 @@ public enum SenseGroupResponseRenderer {
         _ = lines.removeLast()
         return lines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
     }
+
 }

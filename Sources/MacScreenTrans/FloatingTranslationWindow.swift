@@ -7,6 +7,7 @@ final class FloatingTranslationWindowController {
     private let sourceStack = NSStackView()
     private let sourceText = NSTextField(labelWithString: "")
     private let targetTextView = NSTextView()
+    private var dismissArmedAt = Date.distantPast
     nonisolated(unsafe) private var localDismissMonitor: Any?
     nonisolated(unsafe) private var globalKeyMonitor: Any?
     nonisolated(unsafe) private var globalMouseMonitor: Any?
@@ -102,6 +103,7 @@ final class FloatingTranslationWindowController {
         update(text)
         panel.setFrameOrigin(origin(near: point, size: panel.frame.size))
         panel.orderFrontRegardless()
+        dismissArmedAt = Date().addingTimeInterval(0.25)
     }
 
     func update(_ text: String) {
@@ -156,8 +158,27 @@ final class FloatingTranslationWindowController {
         header.addArrangedSubview(badge)
         header.addArrangedSubview(titleStack)
         header.addArrangedSubview(NSView())
+        let copyButton = NSButton(
+            image: NSImage(systemSymbolName: "doc.on.doc", accessibilityDescription: "复制译文") ?? NSImage(),
+            target: self,
+            action: #selector(copyCurrentText)
+        )
+        copyButton.bezelStyle = .accessoryBarAction
+        copyButton.isBordered = false
+        copyButton.toolTip = "复制译文"
+        copyButton.contentTintColor = .secondaryLabelColor
+        header.addArrangedSubview(copyButton)
         header.setHuggingPriority(.defaultLow, for: .horizontal)
         return header
+    }
+
+    @objc private func copyCurrentText() {
+        let text = targetTextView.string.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return }
+
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+        statusLabel.stringValue = "已复制"
     }
 
     private func configureSourceStack() {
@@ -227,6 +248,7 @@ final class FloatingTranslationWindowController {
     }
 
     private func closeIfClickIsOutsidePanel() {
+        guard Date() >= dismissArmedAt else { return }
         guard panel.isVisible, !panel.frame.contains(NSEvent.mouseLocation) else { return }
         close()
     }
@@ -253,29 +275,30 @@ private struct ParsedPopupText {
         let text = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
         if text.hasPrefix("意群:"),
            let targetRange = text.range(of: "\n释义:") {
-            status = "Translation"
+            let parsedTarget = text[targetRange.upperBound...]
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            status = parsedTarget.isEmpty || parsedTarget.hasPrefix("正在") ? "翻译中" : "翻译完成"
             source = text[text.index(text.startIndex, offsetBy: 3)..<targetRange.lowerBound]
                 .trimmingCharacters(in: .whitespacesAndNewlines)
-            target = text[targetRange.upperBound...]
-                .trimmingCharacters(in: .whitespacesAndNewlines)
+            target = parsedTarget.isEmpty ? "正在补译..." : parsedTarget
             return
         }
 
         if text.hasPrefix("正在解释：") {
-            status = "Streaming"
+            status = "翻译中"
             source = String(text.dropFirst("正在解释：".count)).trimmingCharacters(in: .whitespacesAndNewlines)
             target = "等待模型输出..."
             return
         }
 
         if text.isEmpty {
-            status = "Ready"
+            status = "就绪"
             source = ""
             target = ""
             return
         }
 
-        status = "Status"
+        status = "状态"
         source = ""
         target = text
     }
