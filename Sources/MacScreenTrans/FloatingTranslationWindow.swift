@@ -15,7 +15,9 @@ final class FloatingTranslationWindowController {
     private let panel: NSPanel
     private let statusLabel = NSTextField(labelWithString: "Ready")
     private let sourceStack = NSStackView()
-    private let sourceText = NSTextField(labelWithString: "")
+    private let wordLabel = NSTextField(labelWithString: "")
+    private let posLabel = NSTextField(labelWithString: "")
+    private let briefLabel = NSTextField(labelWithString: "")
     private let targetTextView = NSTextView()
     private let bubbleBackground: BubbleBackgroundView
     private var dismissArmedAt = Date.distantPast
@@ -185,8 +187,12 @@ final class FloatingTranslationWindowController {
     func update(_ text: String) {
         let parsed = ParsedPopupText(text)
         statusLabel.stringValue = parsed.status
-        sourceStack.isHidden = parsed.source.isEmpty
-        sourceText.stringValue = parsed.source
+        wordLabel.stringValue = parsed.word
+        posLabel.stringValue = parsed.wordPOS
+        posLabel.isHidden = parsed.wordPOS.isEmpty
+        briefLabel.stringValue = parsed.wordBrief
+        briefLabel.isHidden = parsed.wordBrief.isEmpty
+        sourceStack.isHidden = parsed.word.isEmpty
         targetTextView.string = parsed.target
         targetTextView.scrollToEndOfDocument(nil)
     }
@@ -260,25 +266,58 @@ final class FloatingTranslationWindowController {
     }
 
     private func configureSourceStack() {
+        // Mini-dictionary entry for the pointed word.
+        // Layout:
+        //   [Word]                       — 22pt semibold, label color
+        //   [POS · Brief]                — POS italic 13pt secondary, brief 14pt label
+        //   [Thin separator]             — full-width separator above the phrase translation
         sourceStack.orientation = .vertical
-        sourceStack.spacing = 5
+        sourceStack.spacing = 4
         sourceStack.alignment = .leading
 
-        let caption = NSTextField(labelWithString: "意群")
-        caption.font = .systemFont(ofSize: 11, weight: .semibold)
-        caption.textColor = .secondaryLabelColor
+        wordLabel.font = .systemFont(ofSize: 22, weight: .semibold)
+        wordLabel.textColor = .labelColor
+        wordLabel.lineBreakMode = .byTruncatingTail
+        wordLabel.maximumNumberOfLines = 1
 
-        sourceText.font = .systemFont(ofSize: 16, weight: .semibold)
-        sourceText.textColor = .labelColor
-        sourceText.lineBreakMode = .byTruncatingTail
-        sourceText.maximumNumberOfLines = 2
-        sourceText.wantsLayer = true
-        sourceText.layer?.cornerRadius = 8
-        sourceText.layer?.backgroundColor = NSColor.controlAccentColor.withAlphaComponent(0.13).cgColor
+        let posBriefRow = NSStackView()
+        posBriefRow.orientation = .horizontal
+        posBriefRow.alignment = .firstBaseline
+        posBriefRow.spacing = 6
 
-        sourceStack.addArrangedSubview(caption)
-        sourceStack.addArrangedSubview(sourceText)
-        sourceText.widthAnchor.constraint(equalTo: sourceStack.widthAnchor).isActive = true
+        let posBaseFont = NSFont.systemFont(ofSize: 13)
+        let italicDescriptor = posBaseFont.fontDescriptor.withSymbolicTraits(.italic)
+        posLabel.font = NSFont(descriptor: italicDescriptor, size: 13) ?? posBaseFont
+        posLabel.textColor = .secondaryLabelColor
+        posLabel.lineBreakMode = .byTruncatingTail
+        posLabel.maximumNumberOfLines = 1
+
+        briefLabel.font = .systemFont(ofSize: 14)
+        briefLabel.textColor = .labelColor
+        briefLabel.lineBreakMode = .byTruncatingTail
+        briefLabel.maximumNumberOfLines = 2
+        briefLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
+
+        posBriefRow.addArrangedSubview(posLabel)
+        posBriefRow.addArrangedSubview(briefLabel)
+
+        // 10pt vertical gap before the separator that divides the dictionary
+        // entry from the phrase translation scroll view below.
+        let gap = NSView()
+        gap.translatesAutoresizingMaskIntoConstraints = false
+        gap.heightAnchor.constraint(equalToConstant: 6).isActive = true
+
+        let innerSeparator = NSBox()
+        innerSeparator.boxType = .separator
+
+        sourceStack.addArrangedSubview(wordLabel)
+        sourceStack.addArrangedSubview(posBriefRow)
+        sourceStack.addArrangedSubview(gap)
+        sourceStack.addArrangedSubview(innerSeparator)
+
+        wordLabel.widthAnchor.constraint(equalTo: sourceStack.widthAnchor).isActive = true
+        posBriefRow.widthAnchor.constraint(equalTo: sourceStack.widthAnchor).isActive = true
+        innerSeparator.widthAnchor.constraint(equalTo: sourceStack.widthAnchor).isActive = true
     }
 
     private func origin(near point: CGPoint, size: CGSize) -> CGPoint {
@@ -346,55 +385,156 @@ final class FloatingTranslationWindowController {
 
 private struct ParsedPopupText {
     let status: String
+    let word: String
+    let wordPOS: String
+    let wordBrief: String
     let source: String
     let target: String
 
     init(_ rawText: String) {
         let text = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
-        let sourcePrefix = "意群:"
-        let targetPrefix = "\n释义:"
 
-        if text.hasPrefix(sourcePrefix) {
-            let afterSourcePrefix = text.index(text.startIndex, offsetBy: sourcePrefix.count)
+        // 1) New tagged schema: 单词 / 词性 / 释义 / 意群 / 译文.
+        let tagged = Self.parseTaggedSchema(text)
+        if tagged.matched {
+            self.word = tagged.word
+            self.wordPOS = tagged.wordPOS
+            self.wordBrief = tagged.wordBrief
+            self.source = tagged.source
+            let resolvedTarget = tagged.target
+            if resolvedTarget.isEmpty {
+                self.target = tagged.source.isEmpty ? "" : "正在补译..."
+                self.status = "翻译中"
+            } else {
+                self.target = resolvedTarget
+                self.status = resolvedTarget.hasPrefix("正在") ? "翻译中" : "翻译完成"
+            }
+            return
+        }
 
-            if let targetRange = text.range(of: targetPrefix) {
+        // 2) Legacy schema from prior streaming partials: "意群: X[\n释义: Y]".
+        //    Kept so transitional or fallback-path strings still render.
+        let legacySourcePrefix = "意群:"
+        let legacyTargetPrefix = "\n释义:"
+
+        if text.hasPrefix(legacySourcePrefix) {
+            let afterSourcePrefix = text.index(text.startIndex, offsetBy: legacySourcePrefix.count)
+
+            if let targetRange = text.range(of: legacyTargetPrefix) {
                 let parsedTarget = text[targetRange.upperBound...]
                     .trimmingCharacters(in: .whitespacesAndNewlines)
-                status = parsedTarget.isEmpty || parsedTarget.hasPrefix("正在") ? "翻译中" : "翻译完成"
-                source = text[afterSourcePrefix..<targetRange.lowerBound]
+                let parsedSource = text[afterSourcePrefix..<targetRange.lowerBound]
                     .trimmingCharacters(in: .whitespacesAndNewlines)
-                target = parsedTarget.isEmpty ? "正在补译..." : parsedTarget
+                self.status = parsedTarget.isEmpty || parsedTarget.hasPrefix("正在") ? "翻译中" : "翻译完成"
+                self.word = parsedSource
+                self.wordPOS = ""
+                self.wordBrief = ""
+                self.source = parsedSource
+                self.target = parsedTarget.isEmpty ? "正在补译..." : parsedTarget
                 return
             }
 
-            // Streaming may emit "意群: X" before the next chunk adds "\n释义: Y".
-            // Don't drop into the catch-all path (which hides the source field and
-            // dumps the whole line into the translation slot); keep the source
-            // visible and show a placeholder until the target arrives.
-            status = "翻译中"
-            source = text[afterSourcePrefix...]
+            self.status = "翻译中"
+            let parsedSource = text[afterSourcePrefix...]
                 .trimmingCharacters(in: .whitespacesAndNewlines)
-            target = "正在补译..."
+            self.word = parsedSource
+            self.wordPOS = ""
+            self.wordBrief = ""
+            self.source = parsedSource
+            self.target = "正在补译..."
             return
         }
 
         if text.hasPrefix("正在解释：") {
-            status = "翻译中"
-            source = String(text.dropFirst("正在解释：".count)).trimmingCharacters(in: .whitespacesAndNewlines)
-            target = "等待模型输出..."
+            self.status = "翻译中"
+            let parsedSource = String(text.dropFirst("正在解释：".count)).trimmingCharacters(in: .whitespacesAndNewlines)
+            self.word = parsedSource
+            self.wordPOS = ""
+            self.wordBrief = ""
+            self.source = parsedSource
+            self.target = "等待模型输出..."
             return
         }
 
         if text.isEmpty {
-            status = "就绪"
-            source = ""
-            target = ""
+            self.status = "就绪"
+            self.word = ""
+            self.wordPOS = ""
+            self.wordBrief = ""
+            self.source = ""
+            self.target = ""
             return
         }
 
-        status = "状态"
-        source = ""
-        target = text
+        // Catch-all: status messages or fallback plain text.
+        self.status = "状态"
+        self.word = ""
+        self.wordPOS = ""
+        self.wordBrief = ""
+        self.source = ""
+        self.target = text
+    }
+
+    private struct TaggedParse {
+        var matched: Bool
+        var word: String
+        var wordPOS: String
+        var wordBrief: String
+        var source: String
+        var target: String
+    }
+
+    /// Parse the tagged popup schema emitted by `SenseGroupResponseRenderer.displayText`.
+    /// Schema lines (any subset, in this order):
+    ///   单词: <word>
+    ///   词性: <pos>
+    ///   释义: <brief>
+    ///   意群: <source_chunk>
+    ///   译文: <target_chunk>
+    /// `matched` is true only when a tag exclusive to the new schema is seen
+    /// (单词 / 词性 / 译文). 释义 and 意群 alone overlap with the legacy
+    /// format so they don't trigger a new-schema match on their own.
+    private static func parseTaggedSchema(_ text: String) -> TaggedParse {
+        var result = TaggedParse(
+            matched: false,
+            word: "",
+            wordPOS: "",
+            wordBrief: "",
+            source: "",
+            target: ""
+        )
+
+        let lines = text.components(separatedBy: "\n")
+        for rawLine in lines {
+            let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            if line.isEmpty { continue }
+
+            if let value = Self.value(after: "单词:", in: line) {
+                result.word = value
+                result.matched = true
+            } else if let value = Self.value(after: "词性:", in: line) {
+                result.wordPOS = value
+                result.matched = true
+            } else if let value = Self.value(after: "译文:", in: line) {
+                result.target = value
+                result.matched = true
+            } else if let value = Self.value(after: "释义:", in: line) {
+                // Ambiguous tag: in the new schema it carries the word brief;
+                // in the legacy format it carries the phrase translation.
+                // Capture it but don't flip `matched` on its strength alone.
+                result.wordBrief = value
+            } else if let value = Self.value(after: "意群:", in: line) {
+                // Same caveat as 释义: present in both schemas.
+                result.source = value
+            }
+        }
+        return result
+    }
+
+    private static func value(after prefix: String, in line: String) -> String? {
+        guard line.hasPrefix(prefix) else { return nil }
+        let valueStart = line.index(line.startIndex, offsetBy: prefix.count)
+        return String(line[valueStart...]).trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
 

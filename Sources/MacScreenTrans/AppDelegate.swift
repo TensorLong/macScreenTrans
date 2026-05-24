@@ -13,10 +13,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let controller = FloatingTranslationWindowController()
         controller.setOnClose { [weak self] in
             self?.highlightOverlay.hide()
+            self?.phraseOverlay.hide()
         }
         return controller
     }()
     private lazy var highlightOverlay = WordHighlightOverlayController()
+    private lazy var phraseOverlay = PhraseHighlightOverlayController()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         AppConfiguration.bootstrapDefaults()
@@ -152,6 +154,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func handleThreeFingerTap() {
         streamingTask?.cancel()
         highlightOverlay.hide()
+        phraseOverlay.hide()
         let point = NSEvent.mouseLocation
 
         guard PermissionHelper.accessibilityTrusted else {
@@ -170,7 +173,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 当前位置不支持取词。
                 请把鼠标放在可选择的正文或输入框文字上再试。
 
-                — AX 诊断（v0.1.10 debug）—
+                — AX 诊断（v0.2 debug）—
                 \(AXWordReader.lastDiagnostic)
                 """
             )
@@ -196,13 +199,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         popup.update("正在解释：\(selection.word)\n\n")
-        streamingTask = Task { [client, popup] in
+        let lookupBox = PhraseLookupBox(result: result)
+        streamingTask = Task { [client, popup, phraseOverlay, lookupBox] in
             do {
                 var output = ""
                 for try await delta in client.streamExplanation(selection: selection, config: config) {
                     output += delta
                     await MainActor.run {
-                        popup.update(SenseGroupResponseRenderer.displayText(for: output.isEmpty ? "正在识别意群..." : output))
+                        popup.update(SenseGroupResponseRenderer.displayText(
+                            for: output.isEmpty ? "正在识别意群..." : output,
+                            overrideWord: selection.word
+                        ))
                     }
                 }
                 if output.isEmpty {
@@ -210,13 +217,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         popup.update("模型没有返回内容。")
                     }
                 } else if let response = SenseGroupResponseRenderer.response(for: output) {
+                    // Reveal the green phrase overlay as soon as the LLM gives us
+                    // a usable source phrase, regardless of whether we'll later
+                    // fall through to the translation-only fallback. Per-line
+                    // segments come from AXWordReader.phraseSegments.
+                    if !response.source.isEmpty {
+                        let phrase = response.source
+                        await MainActor.run {
+                            let segs = lookupBox.result.phraseSegments(for: phrase)
+                            if !segs.isEmpty {
+                                phraseOverlay.show(segments: segs, font: nil)
+                            }
+                        }
+                    }
                     if SenseGroupResponseRenderer.needsTranslationFallback(
                         response,
                         targetLanguage: config.targetLanguage
                     ) {
                         let fallbackSource = response.source.isEmpty ? selection.word : response.source
                         await MainActor.run {
-                            popup.update("意群: \(fallbackSource)\n释义: 正在补译...")
+                            popup.update("单词: \(selection.word)\n意群: \(fallbackSource)\n译文: 正在补译...")
                         }
                         let fallbackSelection = WordSelection(
                             word: fallbackSource,
@@ -230,18 +250,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                             fallbackOutput += delta
                             await MainActor.run {
                                 let target = SenseGroupResponseRenderer.plainTranslationText(for: fallbackOutput)
-                                popup.update("意群: \(fallbackSource)\n释义: \(target.isEmpty ? "正在补译..." : target)")
+                                popup.update("单词: \(selection.word)\n意群: \(fallbackSource)\n译文: \(target.isEmpty ? "正在补译..." : target)")
                             }
                         }
                         let finalTarget = SenseGroupResponseRenderer.plainTranslationText(for: fallbackOutput)
                         await MainActor.run {
                             popup.update(
-                                "意群: \(fallbackSource)\n释义: \(finalTarget.isEmpty ? "模型没有返回译文，请重试。" : finalTarget)"
+                                "单词: \(selection.word)\n意群: \(fallbackSource)\n译文: \(finalTarget.isEmpty ? "模型没有返回译文，请重试。" : finalTarget)"
                             )
                         }
                     } else {
                         await MainActor.run {
-                            popup.update(SenseGroupResponseRenderer.displayText(for: output))
+                            popup.update(SenseGroupResponseRenderer.displayText(for: output, overrideWord: selection.word))
                         }
                     }
                 } else if SenseGroupResponseRenderer.isLikelyStructuredResponse(output),
@@ -317,4 +337,14 @@ extension AppDelegate: NSMenuDelegate {
     func menuNeedsUpdate(_ menu: NSMenu) {
         rebuildStatusMenu()
     }
+}
+
+/// Carries an `AXWordReader.Result` across the Sendable boundary into the
+/// streaming Task. The wrapped Result holds an AXUIElement; CoreFoundation
+/// retain/release and the AX accessor APIs we touch are documented as safe
+/// from background queues, so the unchecked conformance is sound. Wrapping
+/// keeps the unsafety contained — Swift 6 strict-concurrency only sees a
+/// single explicit override here.
+private struct PhraseLookupBox: @unchecked Sendable {
+    let result: AXWordReader.Result
 }

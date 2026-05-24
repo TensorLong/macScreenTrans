@@ -3,7 +3,11 @@ import AppKit
 /// A click-through borderless panel that draws Apple's "Look Up" yellow
 /// highlight: a rounded yellow bubble behind the recognized word, with the
 /// word redrawn slightly enlarged and lifted upward so it pops off the
-/// surrounding text.
+/// surrounding text. As of v0.2 the bubble fill is fully opaque so it
+/// completely covers the original glyph behind it — pairs with the green
+/// PhraseHighlightOverlay (panel level `.floating`) which sits one z-level
+/// below this one (`.popUpMenu`) so the yellow word stays on top of the
+/// green phrase band.
 @MainActor
 final class WordHighlightOverlayController {
     private let panel: NSPanel
@@ -109,14 +113,18 @@ private final class HighlightView: NSView {
         super.draw(dirtyRect)
         guard wordRectInPanel.width > 0, wordRectInPanel.height > 0 else { return }
 
-        // Yellow bubble — slightly inset so it hugs the word.
+        // Yellow bubble — slightly inset so it hugs the word. Fully opaque
+        // so the bubble masks the glyph beneath it (the redraw below is the
+        // visible text). The rim is the system yellow at full alpha too;
+        // keeping fill and stroke from the same color gives the classic
+        // Look Up edge without manual color mixing.
         let bubbleRect = wordRectInPanel.insetBy(dx: -3, dy: -2)
         let bubblePath = NSBezierPath(roundedRect: bubbleRect, xRadius: 5, yRadius: 5)
-        NSColor.systemYellow.withAlphaComponent(0.55).setFill()
+        NSColor.systemYellow.setFill()
         bubblePath.fill()
 
         // Hairline border to match Apple's Look Up shape edge.
-        NSColor.systemYellow.withAlphaComponent(0.85).setStroke()
+        NSColor.systemYellow.setStroke()
         bubblePath.lineWidth = 0.5
         bubblePath.stroke()
 

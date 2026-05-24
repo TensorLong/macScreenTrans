@@ -53,13 +53,15 @@ public enum PromptBuilder {
     8. Never copy rule text such as "exact substring of the sentence" unless it
        literally appears in the user's sentence.
     9. target_chunk must be non-empty and written in {target_language}.
+    10. word_pos MUST be a short English POS abbreviation with trailing period (one of: adj., n., v., adv., prep., conj., pron., interj.).
+    11. word_brief MUST be a 5-15 character {target_language} dictionary-style definition for the POINTED word only (not the phrase). Separate multiple senses with "；". Do NOT include the POS in word_brief.
 
     Output schema (return this exact JSON object and nothing else):
-    {"source_chunk":"...","target_chunk":"..."}
+    {"source_chunk":"...","target_chunk":"...","word_pos":"...","word_brief":"..."}
 
     Example
     Input:  {"word":"twist","sentence":"It's an ironic twist that we might all end up as NPCs.","target_language":"zh"}
-    Output: {"source_chunk":"an ironic twist","target_chunk":"具有讽刺意味的转折"}
+    Output: {"source_chunk":"an ironic twist","target_chunk":"具有讽刺意味的转折","word_pos":"n.","word_brief":"转折；转变"}
     """
 
     public static let translationOnlyPromptTemplate = """

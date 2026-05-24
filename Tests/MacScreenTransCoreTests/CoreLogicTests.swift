@@ -54,13 +54,19 @@ import Testing
 @Test func senseGroupRendererFormatsCompletedJSON() {
     let raw = "{\"source_chunk\":\"an ironic twist\",\"target_chunk\":\"具有讽刺意味的转折\"}"
 
-    #expect(SenseGroupResponseRenderer.displayText(for: raw) == "意群: an ironic twist\n释义: 具有讽刺意味的转折")
+    #expect(
+        SenseGroupResponseRenderer.displayText(for: raw) ==
+        "单词: an ironic twist\n意群: an ironic twist\n译文: 具有讽刺意味的转折"
+    )
 }
 
 @Test func senseGroupRendererAcceptsLegacyTranslationAliases() {
     let raw = "{\"source_chunk\":\"given a sentence\",\"translation\":\"给定一个句子\"}"
 
-    #expect(SenseGroupResponseRenderer.displayText(for: raw) == "意群: given a sentence\n释义: 给定一个句子")
+    #expect(
+        SenseGroupResponseRenderer.displayText(for: raw) ==
+        "单词: given a sentence\n意群: given a sentence\n译文: 给定一个句子"
+    )
 }
 
 @Test func senseGroupRendererAcceptsChunkAliasAndMarkdownFence() {
@@ -70,7 +76,10 @@ import Testing
     ```
     """
 
-    #expect(SenseGroupResponseRenderer.displayText(for: raw) == "意群: given a sentence\n释义: 给定一个句子")
+    #expect(
+        SenseGroupResponseRenderer.displayText(for: raw) ==
+        "单词: given a sentence\n意群: given a sentence\n译文: 给定一个句子"
+    )
 }
 
 @Test func senseGroupRendererHidesPartialJSONStream() {
@@ -82,7 +91,82 @@ import Testing
 @Test func senseGroupRendererShowsPendingTargetForSourceOnlyJSON() {
     let raw = "{\"source_chunk\":\"given a sentence\"}"
 
-    #expect(SenseGroupResponseRenderer.displayText(for: raw) == "意群: given a sentence\n释义: 正在补译...")
+    #expect(
+        SenseGroupResponseRenderer.displayText(for: raw) ==
+        "单词: given a sentence\n意群: given a sentence\n译文: 正在补译..."
+    )
+}
+
+@Test func senseGroupRendererEmitsMiniDictionaryFieldsForFullResponse() {
+    let raw = "{\"source_chunk\":\"an ironic twist\",\"target_chunk\":\"具有讽刺意味的转折\",\"word_pos\":\"n.\",\"word_brief\":\"转折\"}"
+
+    let response = SenseGroupResponseRenderer.response(for: raw)
+    #expect(response?.source == "an ironic twist")
+    #expect(response?.target == "具有讽刺意味的转折")
+    #expect(response?.wordPOS == "n.")
+    #expect(response?.wordBrief == "转折")
+    #expect(response?.hasWordPOS == true)
+    #expect(response?.hasWordBrief == true)
+
+    let display = SenseGroupResponseRenderer.displayText(for: raw)
+    #expect(display.contains("单词: an ironic twist"))
+    #expect(display.contains("词性: n."))
+    #expect(display.contains("释义: 转折"))
+    #expect(display.contains("意群: an ironic twist"))
+    #expect(display.contains("译文: 具有讽刺意味的转折"))
+}
+
+@Test func senseGroupRendererAcceptsPOSAndBriefAliases() {
+    let raw = "{\"source_chunk\":\"quick\",\"target_chunk\":\"敏捷的\",\"pos\":\"adj.\",\"definition\":\"快速的\"}"
+
+    let response = SenseGroupResponseRenderer.response(for: raw)
+    #expect(response?.wordPOS == "adj.")
+    #expect(response?.wordBrief == "快速的")
+}
+
+@Test func senseGroupRendererReturnsResponseWithoutPOSOrBriefForLegacyJSON() {
+    let raw = "{\"source_chunk\":\"X\",\"target_chunk\":\"Y\"}"
+
+    let response = SenseGroupResponseRenderer.response(for: raw)
+    #expect(response != nil)
+    #expect(response?.wordPOS == "")
+    #expect(response?.wordBrief == "")
+    #expect(response?.hasWordPOS == false)
+    #expect(response?.hasWordBrief == false)
+}
+
+@Test func senseGroupRendererOmitsEmptyPOSAndBriefLines() {
+    let raw = "{\"source_chunk\":\"X\",\"target_chunk\":\"Y\"}"
+
+    let display = SenseGroupResponseRenderer.displayText(for: raw)
+    #expect(!display.contains("词性:"))
+    // 释义 is the word-brief tag in the new schema. With no brief returned,
+    // that line must be omitted entirely.
+    #expect(!display.contains("释义:"))
+    #expect(display.contains("意群: X"))
+    #expect(display.contains("译文: Y"))
+}
+
+@Test func senseGroupRendererHonorsExplicitOverrideWord() {
+    let raw = "{\"source_chunk\":\"an ironic twist\",\"target_chunk\":\"具有讽刺意味的转折\",\"word_pos\":\"n.\",\"word_brief\":\"转折\"}"
+
+    let display = SenseGroupResponseRenderer.displayText(for: raw, overrideWord: "quick")
+    #expect(display.hasPrefix("单词: quick\n"))
+    // The phrase translation pair is unaffected by the override.
+    #expect(display.contains("意群: an ironic twist"))
+    #expect(display.contains("译文: 具有讽刺意味的转折"))
+}
+
+@Test func senseGroupRendererTreatsBlankOverrideWordAsSourceFallback() {
+    let raw = "{\"source_chunk\":\"twist\",\"target_chunk\":\"转折\"}"
+
+    let display = SenseGroupResponseRenderer.displayText(for: raw, overrideWord: "   ")
+    #expect(display.contains("单词: twist"))
+}
+
+@Test func senseGroupRendererDetectsStructuredResponseFromNewFields() {
+    #expect(SenseGroupResponseRenderer.isLikelyStructuredResponse("{\"word_pos\":\"adj.\"}"))
+    #expect(SenseGroupResponseRenderer.isLikelyStructuredResponse("{\"word_brief\":\"快速的\"}"))
 }
 
 @Test func senseGroupRendererRequestsFallbackForMissingOrNonChineseTarget() throws {
@@ -169,7 +253,9 @@ import Testing
     #expect(prompt.contains("ONLY a JSON object"))
     #expect(prompt.contains("source_chunk MUST be an exact substring"))
     #expect(prompt.contains("target_chunk MUST translate ONLY source_chunk"))
-    #expect(prompt.contains("{\"source_chunk\":\"...\",\"target_chunk\":\"...\"}"))
+    #expect(prompt.contains("word_pos MUST be a short English POS abbreviation"))
+    #expect(prompt.contains("word_brief MUST be a 5-15 character"))
+    #expect(prompt.contains("{\"source_chunk\":\"...\",\"target_chunk\":\"...\",\"word_pos\":\"...\",\"word_brief\":\"...\"}"))
 }
 
 @Test func translationOnlyPromptKeepsFallbackPlainTextContract() {

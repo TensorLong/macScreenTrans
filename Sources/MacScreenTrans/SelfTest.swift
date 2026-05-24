@@ -92,6 +92,11 @@ private final class SelfTestDelegate: NSObject, NSApplicationDelegate {
         var passed = 0
         var failed = 0
         var distinctWords = Set<String>()
+        // Capture the "middle" probe's result so the phrase test can reuse
+        // its AX element without doing a second resolve at a different
+        // position — that keeps phrase lookup independent of further
+        // cursor motion.
+        var middleResult: AXWordReader.Result?
 
         for (name, pt) in positions {
             print("--- probe[\(name)] AppKit=(\(Int(pt.x)),\(Int(pt.y))) ---")
@@ -104,6 +109,9 @@ private final class SelfTestDelegate: NSObject, NSApplicationDelegate {
                 }
                 passed += 1
                 distinctWords.insert(result.selection.word)
+                if name == "middle" {
+                    middleResult = result
+                }
             } else {
                 print("✗ resolve returned nil")
                 failed += 1
@@ -114,11 +122,50 @@ private final class SelfTestDelegate: NSObject, NSApplicationDelegate {
             print()
         }
 
+        // v0.2 phrase-rect probe: ask for a 3-word substring of the probe
+        // text and confirm we get back at least one segment whose `text`
+        // contains the leading word. The leading word check guards against
+        // a fuzzy match that landed on a non-overlapping span.
+        let phrase = "quick brown fox"
+        let leadingWord = "quick"
+        var phraseSegments: [AXWordReader.PhraseSegment] = []
+        var phraseOK = false
+        print("--- phrase[\"\(phrase)\"] using middle probe ---")
+        if let result = middleResult {
+            phraseSegments = result.phraseSegments(for: phrase)
+            if phraseSegments.isEmpty {
+                print("✗ no segments returned")
+            } else {
+                for (idx, seg) in phraseSegments.enumerated() {
+                    print("  seg[\(idx)] rect=(\(Int(seg.rect.minX)),\(Int(seg.rect.minY))) \(Int(seg.rect.width))×\(Int(seg.rect.height)) text=\"\(seg.text)\"")
+                }
+                let containsLeading = phraseSegments.contains { seg in
+                    seg.text.lowercased().contains(leadingWord)
+                }
+                if containsLeading {
+                    print("✓ at least one segment contains \"\(leadingWord)\"")
+                    phraseOK = true
+                } else {
+                    print("✗ no segment contained \"\(leadingWord)\"")
+                }
+            }
+        } else {
+            print("✗ middle probe didn't produce a Result")
+        }
+        for line in AXWordReader.lastDiagnostic.split(separator: "\n") {
+            print("  | \(line)")
+        }
+        print()
+
         print("=== Self-test summary ===")
         print("passed: \(passed)  failed: \(failed)")
         print("distinct words: \(distinctWords.count) — \(distinctWords.sorted().joined(separator: ", "))")
-        if failed == 0 && distinctWords.count >= 3 {
-            print("VERDICT: PASS — multiple distinct words resolved across positions")
+        print("phrase segments: \(phraseSegments.count) phrase OK: \(phraseOK)")
+        let wordProbesPass = (failed == 0 && distinctWords.count >= 3)
+        if wordProbesPass && phraseOK {
+            print("VERDICT: PASS — word probes + phrase probe both succeeded")
+        } else if wordProbesPass && !phraseOK {
+            print("VERDICT: REGRESSION-v0.2-phrase — word probes pass but phrase test failed")
         } else if failed == 0 && distinctWords.count == 1 {
             print("VERDICT: REGRESSION-v0.1.8 — every position returns the same word")
         } else if failed == positions.count {

@@ -3,6 +3,15 @@ import Foundation
 public struct SenseGroupDisplayResponse: Equatable, Sendable {
     public let source: String
     public let target: String
+    public let wordPOS: String
+    public let wordBrief: String
+
+    public init(source: String, target: String, wordPOS: String = "", wordBrief: String = "") {
+        self.source = source
+        self.target = target
+        self.wordPOS = wordPOS
+        self.wordBrief = wordBrief
+    }
 
     public var hasSource: Bool {
         !source.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -10,6 +19,14 @@ public struct SenseGroupDisplayResponse: Equatable, Sendable {
 
     public var hasTarget: Bool {
         !target.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    public var hasWordPOS: Bool {
+        !wordPOS.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    public var hasWordBrief: Bool {
+        !wordBrief.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 }
 
@@ -29,15 +46,37 @@ public enum SenseGroupResponseRenderer {
             in: object,
             keys: ["target_chunk", "translation", "target", "translated_text", "target_text", "target_phrase", "translated", "meaning"]
         )
+        let wordPOS = firstString(
+            in: object,
+            keys: ["word_pos", "pos", "part_of_speech"]
+        )
+        let wordBrief = firstString(
+            in: object,
+            keys: ["word_brief", "brief", "word_definition", "definition", "word_meaning"]
+        )
 
+        // Backward compat: a response is "valid" if it has the legacy phrase
+        // pair. word_pos / word_brief are optional and never gate the result.
         guard !source.isEmpty || !target.isEmpty else {
             return nil
         }
 
-        return SenseGroupDisplayResponse(source: source, target: target)
+        return SenseGroupDisplayResponse(
+            source: source,
+            target: target,
+            wordPOS: wordPOS,
+            wordBrief: wordBrief
+        )
     }
 
     public static func displayText(for rawText: String) -> String {
+        displayText(for: rawText, overrideWord: nil)
+    }
+
+    /// Render the popup text with an explicit word override. Use this when the
+    /// caller knows the actual target word (from AXWordReader.selection.word)
+    /// and wants to display it independently of what the LLM put in source_chunk.
+    public static func displayText(for rawText: String, overrideWord: String?) -> String {
         guard let response = response(for: rawText) else {
             if isLikelyStructuredResponse(rawText) {
                 return "正在识别意群..."
@@ -45,15 +84,27 @@ public enum SenseGroupResponseRenderer {
             return rawText
         }
 
+        let word = (overrideWord?.trimmingCharacters(in: .whitespacesAndNewlines)).flatMap { $0.isEmpty ? nil : $0 }
+            ?? response.source.trimmingCharacters(in: .whitespacesAndNewlines)
+
         var lines: [String] = []
+        if !word.isEmpty {
+            lines.append("单词: \(word)")
+        }
+        if response.hasWordPOS {
+            lines.append("词性: \(response.wordPOS)")
+        }
+        if response.hasWordBrief {
+            lines.append("释义: \(response.wordBrief)")
+        }
         if response.hasSource {
             lines.append("意群: \(response.source)")
         }
         if response.hasSource && !response.hasTarget {
-            lines.append("释义: 正在补译...")
+            lines.append("译文: 正在补译...")
         }
         if response.hasTarget {
-            lines.append("释义: \(response.target)")
+            lines.append("译文: \(response.target)")
         }
         return lines.isEmpty ? "正在等待规范译文..." : lines.joined(separator: "\n")
     }
@@ -91,7 +142,7 @@ public enum SenseGroupResponseRenderer {
             text = value
         }
 
-        for prefix in ["释义:", "翻译:", "Translation:", "translation:"] where text.hasPrefix(prefix) {
+        for prefix in ["释义:", "译文:", "翻译:", "Translation:", "translation:"] where text.hasPrefix(prefix) {
             text = String(text.dropFirst(prefix.count)).trimmingCharacters(in: .whitespacesAndNewlines)
         }
 
@@ -109,7 +160,9 @@ public enum SenseGroupResponseRenderer {
             trimmed.hasPrefix("```") ||
             trimmed.contains("\"source_chunk\"") ||
             trimmed.contains("\"target_chunk\"") ||
-            trimmed.contains("\"translation\"")
+            trimmed.contains("\"translation\"") ||
+            trimmed.contains("\"word_pos\"") ||
+            trimmed.contains("\"word_brief\"")
     }
 
     private static func firstString(in object: [String: Any], keys: [String]) -> String {
