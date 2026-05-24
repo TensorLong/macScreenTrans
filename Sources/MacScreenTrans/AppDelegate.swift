@@ -13,6 +13,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         AppConfiguration.bootstrapDefaults()
+        configureApplicationMenu()
         configureStatusItem()
 
         settingsWindow = SettingsWindowController { [weak self] in
@@ -38,6 +39,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        settingsWindow?.show()
+        return true
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
         streamingTask?.cancel()
         DistributedNotificationCenter.default().removeObserver(self, name: translateNotificationName, object: nil)
@@ -59,6 +65,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(.separator())
         menu.addItem(menuItem("Quit", action: #selector(quit), keyEquivalent: "q"))
         statusItem.menu = menu
+    }
+
+    private func configureApplicationMenu() {
+        let mainMenu = NSMenu()
+
+        let appMenuItem = NSMenuItem()
+        mainMenu.addItem(appMenuItem)
+
+        let appMenu = NSMenu()
+        appMenu.addItem(menuItem("Settings...", action: #selector(showSettings), keyEquivalent: ","))
+        appMenu.addItem(.separator())
+        appMenu.addItem(menuItem("Quit MacScreenTrans", action: #selector(quit), keyEquivalent: "q"))
+        appMenuItem.submenu = appMenu
+
+        NSApp.mainMenu = mainMenu
     }
 
     private func menuItem(_ title: String, action: Selector, keyEquivalent: String) -> NSMenuItem {
