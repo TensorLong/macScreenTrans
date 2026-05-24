@@ -7,17 +7,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let client = OpenAIStreamingClient()
     private var statusItem: NSStatusItem?
     private let statusMenu = NSMenu()
-    private var menuBarBadge: MenuBarBadgeWindowController?
     private var settingsWindow: SettingsWindowController?
     private var streamingTask: Task<Void, Never>?
-    private lazy var popup = FloatingTranslationWindowController()
+    private lazy var popup: FloatingTranslationWindowController = {
+        let controller = FloatingTranslationWindowController()
+        controller.setOnClose { [weak self] in
+            self?.highlightOverlay.hide()
+        }
+        return controller
+    }()
+    private lazy var highlightOverlay = WordHighlightOverlayController()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         AppConfiguration.bootstrapDefaults()
         configureApplicationMenu()
         configureStatusItem()
-        menuBarBadge = MenuBarBadgeWindowController(menu: statusMenu)
-        menuBarBadge?.show()
 
         settingsWindow = SettingsWindowController(
             onSelfCheck: { [weak self] in
@@ -52,10 +56,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func configureStatusItem() {
-        // Hidden Bar / Bartender-style utilities persist NSStatusItem positions
-        // under autosaveName; once the icon is pushed into the collapsed zone it
-        // stays there. Skip autosave so the OS positions the item afresh each
-        // launch, and rely on MenuBarBadgeWindowController as a visible fallback.
+        // Don't set autosaveName: Hidden Bar / Bartender-style utilities can
+        // pin the status item to a collapsed zone permanently.
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         if let button = item.button {
             button.title = "译"
@@ -149,18 +151,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func handleThreeFingerTap() {
         streamingTask?.cancel()
+        highlightOverlay.hide()
         let point = NSEvent.mouseLocation
-        popup.show(at: point, text: "取词中...")
 
         guard PermissionHelper.accessibilityTrusted else {
             PermissionHelper.promptForAccessibility()
-            popup.update("需要辅助功能权限。\n请打开设置页，点击“打开辅助功能设置”，允许 MacScreenTrans 后重启应用。")
+            popup.show(
+                at: point,
+                text: "需要辅助功能权限。\n请打开设置页，点击“打开辅助功能设置”，允许 MacScreenTrans 后重启应用。"
+            )
             return
         }
 
-        guard let selection = AXWordReader.selection(at: point) else {
-            popup.update("当前位置不支持取词。\n请把鼠标放在可选择的正文或输入框文字上再试。图片、部分 PDF 或自绘界面可能不支持。")
+        guard let result = AXWordReader.resolve(at: point) else {
+            popup.show(
+                at: point,
+                text: "当前位置不支持取词。\n请把鼠标放在可选择的正文或输入框文字上再试。图片、部分 PDF 或自绘界面可能不支持。"
+            )
             return
+        }
+        let selection = result.selection
+
+        // Show the popup anchored to the recognized word's screen rect when
+        // AX gives us bounds. Otherwise fall back to the cursor — this still
+        // happens for image PDFs / custom UIs that don't report bounds.
+        if let wordRect = result.wordRect {
+            highlightOverlay.show(word: selection.word, font: nil, at: wordRect)
+            popup.show(anchoredTo: wordRect, text: "取词中...")
+        } else {
+            popup.show(at: point, text: "取词中...")
         }
 
         let config = AppConfiguration.current

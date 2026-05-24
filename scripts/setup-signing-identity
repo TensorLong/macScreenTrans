@@ -1,0 +1,85 @@
+#!/bin/sh
+set -eu
+
+# Create (idempotently) a self-signed code signing identity in the user's login
+# keychain. Used by scripts/package-app to produce a bundle whose codesign
+# Designated Requirement is keyed on this certificate's SHA-1, so macOS TCC
+# (Privacy & Security) keeps Accessibility consent across rebuilds instead of
+# re-prompting on every new ad-hoc cdhash.
+
+IDENTITY_NAME="${MAC_SCREEN_TRANS_SIGNING_IDENTITY:-MacScreenTrans Local Signer}"
+KEYCHAIN="$HOME/Library/Keychains/login.keychain-db"
+DAYS="${MAC_SCREEN_TRANS_SIGNING_DAYS:-3650}"
+
+if security find-certificate -c "$IDENTITY_NAME" "$KEYCHAIN" >/dev/null 2>&1; then
+  echo "Signing identity \"$IDENTITY_NAME\" already exists in the login keychain."
+  echo "Nothing to do. (Delete via Keychain Access if you want to regenerate.)"
+  exit 0
+fi
+
+TMP="$(mktemp -d -t macscreentrans-signing)"
+trap 'rm -rf "$TMP"' EXIT
+
+# basicConstraints CA:FALSE + critical codeSigning EKU is the minimum that
+# `codesign` accepts; without these the cert is treated as generic and the
+# Designated Requirement falls back to cdhash, defeating the whole point.
+cat > "$TMP/codesign.cnf" <<EOF
+[ req ]
+default_bits        = 2048
+default_md          = sha256
+prompt              = no
+distinguished_name  = dn
+x509_extensions     = v3_req
+
+[ dn ]
+CN = $IDENTITY_NAME
+O  = MacScreenTrans
+OU = Local Development
+
+[ v3_req ]
+basicConstraints    = critical, CA:FALSE
+keyUsage            = critical, digitalSignature
+extendedKeyUsage    = critical, codeSigning
+subjectKeyIdentifier = hash
+EOF
+
+openssl req -x509 \
+  -config "$TMP/codesign.cnf" \
+  -days "$DAYS" \
+  -newkey rsa:2048 \
+  -nodes \
+  -keyout "$TMP/key.pem" \
+  -out "$TMP/cert.pem" >/dev/null 2>&1
+
+# Bundle into PKCS#12 because `security import` of a separate key + cert
+# does not consistently register them as a single signing identity.
+P12_PASS="$(openssl rand -hex 16)"
+openssl pkcs12 -export \
+  -inkey "$TMP/key.pem" \
+  -in "$TMP/cert.pem" \
+  -out "$TMP/bundle.p12" \
+  -passout "pass:$P12_PASS" >/dev/null 2>&1
+
+# -T /usr/bin/codesign whitelists codesign for non-interactive key access so
+# the user is never prompted for keychain password during builds.
+security import "$TMP/bundle.p12" \
+  -k "$KEYCHAIN" \
+  -P "$P12_PASS" \
+  -T /usr/bin/codesign \
+  -T /usr/bin/security >/dev/null
+
+# Some macOS versions still trigger the "always allow" dialog on first use
+# unless we explicitly set the partition list. Silently ignore if it fails
+# (older systems don't need it).
+security set-key-partition-list \
+  -S apple-tool:,apple:,codesign: \
+  -s -k "" \
+  "$KEYCHAIN" >/dev/null 2>&1 || true
+
+echo "Created self-signed code signing identity:"
+echo "  Common Name : $IDENTITY_NAME"
+echo "  Keychain    : $KEYCHAIN"
+echo "  Valid for   : $DAYS days"
+echo ""
+echo "scripts/package-app will now sign with this identity."
+echo "macOS TCC (Accessibility) consent should persist across rebuilds."

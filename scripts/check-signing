@@ -1,0 +1,40 @@
+#!/bin/sh
+set -eu
+
+ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+APP="${1:-$ROOT/.build/MacScreenTrans.app}"
+
+if [ ! -d "$APP" ]; then
+  echo "No bundle at $APP. Run scripts/package-app first." >&2
+  exit 1
+fi
+
+echo "Bundle: $APP"
+echo ""
+
+echo "== codesign -dvv =="
+codesign -dvv "$APP" 2>&1 || true
+echo ""
+
+echo "== Designated Requirement =="
+codesign -d -r- "$APP" 2>&1 || true
+echo ""
+
+DR="$(codesign -d -r- "$APP" 2>&1 | tail -n 1)"
+case "$DR" in
+  *cdhash*)
+    printf '\033[1;31mTCC STATUS: UNSTABLE\033[0m\n'
+    echo "  Designated Requirement is keyed on the executable's cdhash."
+    echo "  macOS will revoke Accessibility consent on every rebuild."
+    echo "  Fix: run scripts/setup-signing-identity, then scripts/package-app."
+    ;;
+  *certificate*)
+    printf '\033[1;32mTCC STATUS: STABLE\033[0m\n'
+    echo "  Designated Requirement is keyed on the signing certificate."
+    echo "  macOS will preserve Accessibility consent across rebuilds."
+    ;;
+  *)
+    printf '\033[1;33mTCC STATUS: UNKNOWN\033[0m\n'
+    echo "  Could not classify Designated Requirement: $DR"
+    ;;
+esac

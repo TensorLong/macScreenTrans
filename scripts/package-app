@@ -5,6 +5,7 @@ ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 CONFIGURATION="${1:-debug}"
 APP="$ROOT/.build/MacScreenTrans.app"
 EXECUTABLE="$ROOT/.build/$CONFIGURATION/MacScreenTrans"
+IDENTITY_NAME="${MAC_SCREEN_TRANS_SIGNING_IDENTITY:-MacScreenTrans Local Signer}"
 
 swift build -c "$CONFIGURATION"
 
@@ -12,6 +13,26 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$ROOT/Resources/MacScreenTransInfo.plist" "$APP/Contents/Info.plist"
 cp "$EXECUTABLE" "$APP/Contents/MacOS/MacScreenTrans"
-codesign --force --deep --sign - "$APP" >/dev/null
+
+# Prefer a stable identity (Developer ID, Apple Development, or our local
+# self-signed cert). Falling back to ad-hoc reproduces the original TCC bug
+# where every rebuild changes the Designated Requirement's cdhash and macOS
+# revokes Accessibility consent, so we warn loudly when that happens.
+SIGN_ARGS="--force --deep --options runtime --timestamp=none"
+if security find-certificate -c "$IDENTITY_NAME" >/dev/null 2>&1; then
+  codesign $SIGN_ARGS --sign "$IDENTITY_NAME" "$APP" >/dev/null
+  SIGNED_WITH="$IDENTITY_NAME"
+else
+  printf '\033[1;33m'
+  echo "WARNING: signing identity \"$IDENTITY_NAME\" not found in any keychain."
+  echo "         Falling back to ad-hoc signing. macOS will revoke Accessibility"
+  echo "         consent on every rebuild because the Designated Requirement is"
+  echo "         keyed on the executable's cdhash."
+  echo "         Run scripts/setup-signing-identity once to fix permanently."
+  printf '\033[0m'
+  codesign --force --deep --sign - "$APP" >/dev/null
+  SIGNED_WITH="ad-hoc"
+fi
 
 echo "$APP"
+echo "Signed with: $SIGNED_WITH" >&2

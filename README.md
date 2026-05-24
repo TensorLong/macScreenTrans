@@ -40,10 +40,21 @@ Open MacScreenTrans from `/Applications`; Settings opens automatically. You can 
 
 ## Build
 
+First-time setup (run once, keeps Accessibility consent across rebuilds):
+
+```sh
+scripts/setup-signing-identity
+```
+
+This creates a self-signed code signing certificate (`MacScreenTrans Local Signer`) in your login keychain so every packaged bundle gets the same Designated Requirement. Without it, macOS revokes Accessibility consent on every rebuild because ad-hoc signatures are keyed on the executable's cdhash.
+
+Then build as usual:
+
 ```sh
 scripts/test
 scripts/package-app release
 scripts/package-dmg
+scripts/check-signing            # confirms TCC stability of the bundle
 ```
 
 The packaged app is written to `.build/MacScreenTrans.app`; the release DMG is written to `dist/`.

@@ -1,20 +1,38 @@
 import AppKit
+import MacScreenTransCore
 
 @MainActor
 final class FloatingTranslationWindowController {
+    // Speech-bubble tail dimensions (points). Tuned to match the visual
+    // weight of macOS's native Look Up arrow.
+    private static let tailHeight: CGFloat = 8
+    private static let tailHalfBase: CGFloat = 9
+    private static let cornerRadius: CGFloat = 14
+    private static let contentInset: CGFloat = 14
+    private static let popupWidth: CGFloat = 390
+    private static let popupHeight: CGFloat = 230
+
     private let panel: NSPanel
     private let statusLabel = NSTextField(labelWithString: "Ready")
     private let sourceStack = NSStackView()
     private let sourceText = NSTextField(labelWithString: "")
     private let targetTextView = NSTextView()
+    private let bubbleBackground: BubbleBackgroundView
     private var dismissArmedAt = Date.distantPast
+    private var onCloseHandler: (() -> Void)?
     nonisolated(unsafe) private var localDismissMonitor: Any?
     nonisolated(unsafe) private var globalKeyMonitor: Any?
     nonisolated(unsafe) private var globalMouseMonitor: Any?
 
     init() {
+        let initialFrame = NSRect(
+            x: 0,
+            y: 0,
+            width: Self.popupWidth,
+            height: Self.popupHeight
+        )
         panel = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 390, height: 230),
+            contentRect: initialFrame,
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
@@ -23,31 +41,32 @@ final class FloatingTranslationWindowController {
         panel.collectionBehavior = [.canJoinAllSpaces, .transient]
         panel.backgroundColor = .clear
         panel.isOpaque = false
+        // NSWindow draws a system shadow around the opaque region of its
+        // content; with a bubble mask the shadow follows the tail correctly.
         panel.hasShadow = true
         panel.hidesOnDeactivate = false
         panel.isMovableByWindowBackground = true
         panel.animationBehavior = .utilityWindow
+
+        bubbleBackground = BubbleBackgroundView(frame: initialFrame)
+        panel.contentView = bubbleBackground
 
         let visualEffect = NSVisualEffectView()
         visualEffect.material = .popover
         visualEffect.blendingMode = .behindWindow
         visualEffect.state = .active
         visualEffect.wantsLayer = true
-        visualEffect.layer?.cornerRadius = 14
         visualEffect.translatesAutoresizingMaskIntoConstraints = false
-
-        let root = NSView(frame: panel.contentRect(forFrameRect: panel.frame))
-        root.wantsLayer = true
-        root.layer?.cornerRadius = 14
-        root.addSubview(visualEffect)
-        panel.contentView = root
+        bubbleBackground.addSubview(visualEffect)
+        bubbleBackground.visualEffectView = visualEffect
 
         let contentStack = NSStackView()
         contentStack.orientation = .vertical
         contentStack.spacing = 10
         contentStack.alignment = .leading
         contentStack.translatesAutoresizingMaskIntoConstraints = false
-        root.addSubview(contentStack)
+        bubbleBackground.addSubview(contentStack)
+        bubbleBackground.contentStack = contentStack
 
         let header = makeHeader()
         contentStack.addArrangedSubview(header)
@@ -98,23 +117,71 @@ final class FloatingTranslationWindowController {
         scrollView.widthAnchor.constraint(equalTo: contentStack.widthAnchor).isActive = true
         scrollView.heightAnchor.constraint(greaterThanOrEqualToConstant: 96).isActive = true
 
-        NSLayoutConstraint.activate([
-            visualEffect.leadingAnchor.constraint(equalTo: root.leadingAnchor),
-            visualEffect.trailingAnchor.constraint(equalTo: root.trailingAnchor),
-            visualEffect.topAnchor.constraint(equalTo: root.topAnchor),
-            visualEffect.bottomAnchor.constraint(equalTo: root.bottomAnchor),
-            contentStack.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 14),
-            contentStack.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -14),
-            contentStack.topAnchor.constraint(equalTo: root.topAnchor, constant: 12),
-            contentStack.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -14)
-        ])
+        bubbleBackground.applyContentConstraints(
+            visualEffect: visualEffect,
+            contentStack: contentStack,
+            inset: Self.contentInset,
+            tailHeight: Self.tailHeight
+        )
 
         installDismissMonitors()
     }
 
+    /// Hook invoked whenever the popup closes for any reason (escape, click
+    /// outside, programmatic close). Used by AppDelegate to dismiss the
+    /// yellow word highlight in lockstep with the translation popup.
+    func setOnClose(_ handler: @escaping () -> Void) {
+        onCloseHandler = handler
+    }
+
     func show(at point: CGPoint, text: String) {
         update(text)
-        panel.setFrameOrigin(origin(near: point, size: panel.frame.size))
+        bubbleBackground.tailConfig = nil
+        let size = NSSize(width: Self.popupWidth, height: Self.popupHeight)
+        let origin = origin(near: point, size: size)
+        panel.setFrame(NSRect(origin: origin, size: size), display: true)
+        panel.orderFrontRegardless()
+        dismissArmedAt = Date().addingTimeInterval(0.25)
+    }
+
+    /// Show the popup as a speech bubble anchored to `wordRect` (AppKit
+    /// screen coords). Tail points DOWN at the word when the bubble is
+    /// above, UP when below.
+    func show(anchoredTo wordRect: NSRect, text: String) {
+        update(text)
+
+        let screenFrame = (NSScreen.screens.first {
+            NSMouseInRect(CGPoint(x: wordRect.midX, y: wordRect.midY), $0.frame, false)
+        } ?? NSScreen.main)?.visibleFrame ?? .zero
+
+        // Include the tail in the panel size so the bubble path has room
+        // to draw both the body and the triangle.
+        let size = NSSize(
+            width: Self.popupWidth,
+            height: Self.popupHeight + Self.tailHeight
+        )
+        let verticalGap: CGFloat = 2
+        let placement = ScreenCoordinateConverter.popupPlacement(
+            wordRect: wordRect,
+            popupSize: size,
+            screenVisibleFrame: screenFrame,
+            verticalGap: verticalGap
+        )
+
+        // Constrain tailX so the tail can still draw a clean triangle near
+        // the bubble's rounded corners.
+        let minTail = Self.cornerRadius + Self.tailHalfBase + 2
+        let maxTail = size.width - Self.cornerRadius - Self.tailHalfBase - 2
+        let tailX = max(minTail, min(maxTail, placement.tailX))
+
+        bubbleBackground.tailConfig = BubbleBackgroundView.TailConfig(
+            edge: placement.isAboveWord ? .bottom : .top,
+            tailX: tailX,
+            tailHeight: Self.tailHeight,
+            tailHalfBase: Self.tailHalfBase,
+            cornerRadius: Self.cornerRadius
+        )
+        panel.setFrame(NSRect(origin: placement.origin, size: size), display: true)
         panel.orderFrontRegardless()
         dismissArmedAt = Date().addingTimeInterval(0.25)
     }
@@ -133,7 +200,9 @@ final class FloatingTranslationWindowController {
     }
 
     func close() {
+        guard panel.isVisible else { return }
         panel.orderOut(nil)
+        onCloseHandler?()
     }
 
     private func makeHeader() -> NSView {
@@ -330,5 +399,218 @@ private struct ParsedPopupText {
         status = "状态"
         source = ""
         target = text
+    }
+}
+
+/// Hosts the bubble shape: a rounded rect body plus an optional triangular
+/// tail on either top or bottom edge. The shape is applied as a layer mask
+/// to the panel's visual-effect view so the system blur, shadow, and
+/// content all conform to it.
+private final class BubbleBackgroundView: NSView {
+    struct TailConfig: Equatable {
+        enum Edge { case top, bottom }
+        let edge: Edge
+        let tailX: CGFloat
+        let tailHeight: CGFloat
+        let tailHalfBase: CGFloat
+        let cornerRadius: CGFloat
+    }
+
+    var tailConfig: TailConfig? {
+        didSet {
+            if tailConfig != oldValue { needsLayout = true }
+        }
+    }
+
+    weak var visualEffectView: NSVisualEffectView?
+    weak var contentStack: NSStackView?
+
+    private var contentTopConstraint: NSLayoutConstraint?
+    private var contentBottomConstraint: NSLayoutConstraint?
+    private var baseInset: CGFloat = 14
+    private var baseTailHeight: CGFloat = 0
+
+    override var isFlipped: Bool { false }
+
+    func applyContentConstraints(
+        visualEffect: NSVisualEffectView,
+        contentStack: NSStackView,
+        inset: CGFloat,
+        tailHeight: CGFloat
+    ) {
+        self.baseInset = inset
+        self.baseTailHeight = tailHeight
+
+        // visualEffect fills the whole panel. The bubble path masks it to
+        // the speech-bubble shape (body + tail).
+        let csTop = contentStack.topAnchor.constraint(equalTo: topAnchor, constant: inset)
+        let csBottom = contentStack.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -inset)
+        contentTopConstraint = csTop
+        contentBottomConstraint = csBottom
+
+        NSLayoutConstraint.activate([
+            visualEffect.leadingAnchor.constraint(equalTo: leadingAnchor),
+            visualEffect.trailingAnchor.constraint(equalTo: trailingAnchor),
+            visualEffect.topAnchor.constraint(equalTo: topAnchor),
+            visualEffect.bottomAnchor.constraint(equalTo: bottomAnchor),
+            contentStack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: inset),
+            contentStack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -inset),
+            csTop,
+            csBottom
+        ])
+    }
+
+    override func layout() {
+        super.layout()
+        applyTailLayout()
+        applyMaskAndShadow()
+    }
+
+    private func applyTailLayout() {
+        // When the tail sits on a given edge, content must be pushed away
+        // from that edge by tailHeight so it doesn't draw inside the
+        // triangle.
+        let topInset: CGFloat
+        let bottomInset: CGFloat
+        switch tailConfig?.edge {
+        case .top:
+            topInset = baseTailHeight
+            bottomInset = 0
+        case .bottom:
+            topInset = 0
+            bottomInset = baseTailHeight
+        case .none:
+            topInset = 0
+            bottomInset = 0
+        }
+
+        contentTopConstraint?.constant = baseInset + topInset
+        contentBottomConstraint?.constant = -(baseInset + bottomInset)
+    }
+
+    private func applyMaskAndShadow() {
+        guard let visualEffectView else { return }
+        visualEffectView.wantsLayer = true
+        let layer = visualEffectView.layer ?? CALayer()
+        visualEffectView.layer = layer
+
+        let path = bubblePath(in: visualEffectView.bounds)
+        let maskLayer = (layer.mask as? CAShapeLayer) ?? CAShapeLayer()
+        maskLayer.path = path
+        maskLayer.frame = visualEffectView.bounds
+        layer.mask = maskLayer
+    }
+
+    private func bubblePath(in rect: NSRect) -> CGPath {
+        let path = CGMutablePath()
+        let radius = tailConfig?.cornerRadius ?? 14
+
+        guard let tail = tailConfig else {
+            path.addRoundedRect(in: rect, cornerWidth: radius, cornerHeight: radius)
+            return path
+        }
+
+        // Carve a body rect that leaves room for the tail on one edge.
+        let body: NSRect
+        switch tail.edge {
+        case .bottom:
+            body = NSRect(
+                x: rect.minX,
+                y: rect.minY + tail.tailHeight,
+                width: rect.width,
+                height: rect.height - tail.tailHeight
+            )
+        case .top:
+            body = NSRect(
+                x: rect.minX,
+                y: rect.minY,
+                width: rect.width,
+                height: rect.height - tail.tailHeight
+            )
+        }
+
+        let halfBase = tail.tailHalfBase
+        let height = tail.tailHeight
+        // tailX is expressed in the panel's local x — same origin as `rect`.
+        let tipX = tail.tailX
+
+        switch tail.edge {
+        case .bottom:
+            let bodyBottom = body.minY
+            let tipY = bodyBottom - height
+
+            let leftBase = tipX - halfBase
+            let rightBase = tipX + halfBase
+
+            // Trace clockwise from top-left.
+            path.move(to: CGPoint(x: body.minX + radius, y: body.maxY))
+            path.addLine(to: CGPoint(x: body.maxX - radius, y: body.maxY))
+            path.addArc(
+                tangent1End: CGPoint(x: body.maxX, y: body.maxY),
+                tangent2End: CGPoint(x: body.maxX, y: body.maxY - radius),
+                radius: radius
+            )
+            path.addLine(to: CGPoint(x: body.maxX, y: bodyBottom + radius))
+            path.addArc(
+                tangent1End: CGPoint(x: body.maxX, y: bodyBottom),
+                tangent2End: CGPoint(x: body.maxX - radius, y: bodyBottom),
+                radius: radius
+            )
+            path.addLine(to: CGPoint(x: rightBase, y: bodyBottom))
+            path.addLine(to: CGPoint(x: tipX, y: tipY))
+            path.addLine(to: CGPoint(x: leftBase, y: bodyBottom))
+            path.addLine(to: CGPoint(x: body.minX + radius, y: bodyBottom))
+            path.addArc(
+                tangent1End: CGPoint(x: body.minX, y: bodyBottom),
+                tangent2End: CGPoint(x: body.minX, y: bodyBottom + radius),
+                radius: radius
+            )
+            path.addLine(to: CGPoint(x: body.minX, y: body.maxY - radius))
+            path.addArc(
+                tangent1End: CGPoint(x: body.minX, y: body.maxY),
+                tangent2End: CGPoint(x: body.minX + radius, y: body.maxY),
+                radius: radius
+            )
+            path.closeSubpath()
+
+        case .top:
+            let bodyTop = body.maxY
+            let tipY = bodyTop + height
+
+            let leftBase = tipX - halfBase
+            let rightBase = tipX + halfBase
+
+            path.move(to: CGPoint(x: body.minX + radius, y: bodyTop))
+            path.addLine(to: CGPoint(x: leftBase, y: bodyTop))
+            path.addLine(to: CGPoint(x: tipX, y: tipY))
+            path.addLine(to: CGPoint(x: rightBase, y: bodyTop))
+            path.addLine(to: CGPoint(x: body.maxX - radius, y: bodyTop))
+            path.addArc(
+                tangent1End: CGPoint(x: body.maxX, y: bodyTop),
+                tangent2End: CGPoint(x: body.maxX, y: bodyTop - radius),
+                radius: radius
+            )
+            path.addLine(to: CGPoint(x: body.maxX, y: body.minY + radius))
+            path.addArc(
+                tangent1End: CGPoint(x: body.maxX, y: body.minY),
+                tangent2End: CGPoint(x: body.maxX - radius, y: body.minY),
+                radius: radius
+            )
+            path.addLine(to: CGPoint(x: body.minX + radius, y: body.minY))
+            path.addArc(
+                tangent1End: CGPoint(x: body.minX, y: body.minY),
+                tangent2End: CGPoint(x: body.minX, y: body.minY + radius),
+                radius: radius
+            )
+            path.addLine(to: CGPoint(x: body.minX, y: bodyTop - radius))
+            path.addArc(
+                tangent1End: CGPoint(x: body.minX, y: bodyTop),
+                tangent2End: CGPoint(x: body.minX + radius, y: bodyTop),
+                radius: radius
+            )
+            path.closeSubpath()
+        }
+
+        return path
     }
 }

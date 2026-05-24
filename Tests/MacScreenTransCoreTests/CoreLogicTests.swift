@@ -1,3 +1,4 @@
+import CoreGraphics
 import Foundation
 import Testing
 @testable import MacScreenTransCore
@@ -265,6 +266,87 @@ import Testing
     detector.process(contactCount: 0, timestamp: 10.12)
 
     #expect(count == 0)
+}
+
+@Test func screenCoordinateConverterFlipsQuartzRectToAppKit() {
+    // Primary screen is 1440x900 at origin (0, 0).
+    let primary = CGRect(x: 0, y: 0, width: 1440, height: 900)
+
+    // A Quartz rect 100pt from the top, 30pt tall, at x=200, width=80.
+    let quartz = CGRect(x: 200, y: 100, width: 80, height: 30)
+
+    let appkit = ScreenCoordinateConverter.appKitRect(
+        fromQuartzRect: quartz,
+        primaryScreenFrame: primary
+    )
+
+    #expect(appkit.origin.x == 200)
+    // In AppKit space the bottom edge of the rect is at primary.maxY - quartz.maxY = 900 - 130 = 770.
+    #expect(appkit.origin.y == 770)
+    #expect(appkit.width == 80)
+    #expect(appkit.height == 30)
+}
+
+@Test func popupPlacementPrefersAboveWordWhenSpaceAllows() {
+    let visible = CGRect(x: 0, y: 0, width: 1440, height: 900)
+    let word = CGRect(x: 600, y: 400, width: 80, height: 22)
+    let popup = CGSize(width: 390, height: 230)
+
+    let placement = ScreenCoordinateConverter.popupPlacement(
+        wordRect: word,
+        popupSize: popup,
+        screenVisibleFrame: visible,
+        verticalGap: 6
+    )
+
+    #expect(placement.isAboveWord == true)
+    // The popup's bottom edge should sit verticalGap above the word's top edge.
+    #expect(placement.origin.y == word.maxY + 6)
+    // The popup is centered on the word so its midpoint matches the word's midpoint.
+    let wordCenter = word.midX
+    let popupCenter = placement.origin.x + popup.width / 2
+    #expect(abs(popupCenter - wordCenter) < 0.001)
+    // tailX should point right at the word's center, in popup-local space.
+    #expect(abs(placement.tailX - (wordCenter - placement.origin.x)) < 0.001)
+}
+
+@Test func popupPlacementFlipsBelowWhenNotEnoughRoomAbove() {
+    let visible = CGRect(x: 0, y: 0, width: 1440, height: 900)
+    // Word sits very high on screen — no room above for the popup.
+    let word = CGRect(x: 600, y: 870, width: 80, height: 22)
+    let popup = CGSize(width: 390, height: 230)
+
+    let placement = ScreenCoordinateConverter.popupPlacement(
+        wordRect: word,
+        popupSize: popup,
+        screenVisibleFrame: visible,
+        verticalGap: 6
+    )
+
+    #expect(placement.isAboveWord == false)
+    // Popup top sits verticalGap below the word's bottom.
+    let popupTop = placement.origin.y + popup.height
+    #expect(popupTop == word.minY - 6)
+}
+
+@Test func popupPlacementClampsHorizontallyAtScreenEdge() {
+    let visible = CGRect(x: 0, y: 0, width: 1440, height: 900)
+    // Word near the left edge of the screen.
+    let word = CGRect(x: 10, y: 400, width: 40, height: 20)
+    let popup = CGSize(width: 390, height: 230)
+
+    let placement = ScreenCoordinateConverter.popupPlacement(
+        wordRect: word,
+        popupSize: popup,
+        screenVisibleFrame: visible,
+        verticalGap: 6
+    )
+
+    // The popup must stay 8pt away from the screen's left edge.
+    #expect(placement.origin.x >= visible.minX + 8 - 0.001)
+    // The tail still points at the word's center, even though the popup is offset.
+    let tailScreenX = placement.origin.x + placement.tailX
+    #expect(abs(tailScreenX - word.midX) < 0.001)
 }
 
 private extension String {
