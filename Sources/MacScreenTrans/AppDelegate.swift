@@ -166,7 +166,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let result = AXWordReader.resolve(at: point) else {
             popup.show(
                 at: point,
-                text: "当前位置不支持取词。\n请把鼠标放在可选择的正文或输入框文字上再试。图片、部分 PDF 或自绘界面可能不支持。"
+                text: """
+                当前位置不支持取词。
+                请把鼠标放在可选择的正文或输入框文字上再试。
+
+                — AX 诊断（v0.1.10 debug）—
+                \(AXWordReader.lastDiagnostic)
+                """
             )
             return
         }
