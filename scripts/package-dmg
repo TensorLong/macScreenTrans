@@ -1,0 +1,26 @@
+#!/bin/sh
+set -eu
+
+ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$ROOT/Resources/MacScreenTransInfo.plist")"
+APP="$ROOT/.build/MacScreenTrans.app"
+DIST="$ROOT/dist"
+STAGING="$ROOT/.build/dmg/MacScreenTrans"
+DMG="$DIST/MacScreenTrans-$VERSION.dmg"
+
+"$ROOT/scripts/package-app" release >/dev/null
+
+rm -rf "$STAGING"
+mkdir -p "$STAGING" "$DIST"
+cp -R "$APP" "$STAGING/"
+ln -s /Applications "$STAGING/Applications"
+
+rm -f "$DMG"
+hdiutil create \
+  -volname "MacScreenTrans $VERSION" \
+  -srcfolder "$STAGING" \
+  -ov \
+  -format UDZO \
+  "$DMG" >/dev/null
+
+echo "$DMG"

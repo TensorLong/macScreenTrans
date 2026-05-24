@@ -1,0 +1,17 @@
+#!/bin/sh
+set -eu
+
+ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+CONFIGURATION="${1:-debug}"
+APP="$ROOT/.build/MacScreenTrans.app"
+EXECUTABLE="$ROOT/.build/$CONFIGURATION/MacScreenTrans"
+
+swift build -c "$CONFIGURATION"
+
+rm -rf "$APP"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+cp "$ROOT/Resources/MacScreenTransInfo.plist" "$APP/Contents/Info.plist"
+cp "$EXECUTABLE" "$APP/Contents/MacOS/MacScreenTrans"
+codesign --force --deep --sign - "$APP" >/dev/null
+
+echo "$APP"
