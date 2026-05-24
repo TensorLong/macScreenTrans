@@ -3,13 +3,13 @@ import MacScreenTransCore
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
     private let trackpadMonitor = TrackpadTapMonitor()
-    private let popup = FloatingTranslationWindowController()
     private let client = OpenAIStreamingClient()
     private let translateNotificationName = Notification.Name("com.longmac.MacScreenTrans.translateUnderCursor")
+    private var statusItem: NSStatusItem?
     private var settingsWindow: SettingsWindowController?
     private var streamingTask: Task<Void, Never>?
+    private lazy var popup = FloatingTranslationWindowController()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         AppConfiguration.bootstrapDefaults()
@@ -51,8 +51,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func configureStatusItem() {
-        statusItem.button?.title = "译"
-        statusItem.button?.toolTip = "MacScreenTrans"
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        statusItem?.button?.title = "译"
+        statusItem?.button?.toolTip = "MacScreenTrans"
 
         let menu = NSMenu()
         menu.addItem(menuItem("Translate Under Cursor", action: #selector(translateUnderCursor), keyEquivalent: ""))
@@ -64,7 +65,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(menuItem("Stop Listening", action: #selector(stopListening), keyEquivalent: ""))
         menu.addItem(.separator())
         menu.addItem(menuItem("Quit", action: #selector(quit), keyEquivalent: "q"))
-        statusItem.menu = menu
+        statusItem?.menu = menu
     }
 
     private func configureApplicationMenu() {
