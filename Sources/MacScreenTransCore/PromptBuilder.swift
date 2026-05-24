@@ -57,6 +57,11 @@ public enum PromptBuilder {
     Output: {"source_chunk":"an ironic twist","target_chunk":"具有讽刺意味的转折"}
     """
 
+    public static let translationOnlyPromptTemplate = """
+    Translate the phrase in the user payload to {target_language}.
+    Output ONLY the translated text. No JSON, no markdown, no explanations.
+    """
+
     public static func messages(selection: WordSelection, config: TranslationConfig) -> [ChatMessage] {
         let system = fillTemplate(config.promptTemplate, selection: selection, config: config)
         let payload: [String: Any] = [

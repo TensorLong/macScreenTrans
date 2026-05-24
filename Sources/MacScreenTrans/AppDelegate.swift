@@ -150,6 +150,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     await MainActor.run {
                         popup.update("模型没有返回内容。")
                     }
+                } else if let response = SenseGroupResponseRenderer.response(for: output),
+                          response.hasSource,
+                          !response.hasTarget {
+                    await MainActor.run {
+                        popup.update("意群: \(response.source)\n释义: 正在补译...")
+                    }
+                    let fallbackSelection = WordSelection(
+                        word: response.source,
+                        context: response.source,
+                        wordRangeInContext: 0..<response.source.utf16.count
+                    )
+                    var fallbackConfig = config
+                    fallbackConfig.promptTemplate = PromptBuilder.translationOnlyPromptTemplate
+                    var fallbackOutput = ""
+                    for try await delta in client.streamExplanation(selection: fallbackSelection, config: fallbackConfig) {
+                        fallbackOutput += delta
+                        await MainActor.run {
+                            let target = fallbackOutput.trimmingCharacters(in: .whitespacesAndNewlines)
+                            popup.update("意群: \(response.source)\n释义: \(target.isEmpty ? "正在补译..." : target)")
+                        }
+                    }
                 }
             } catch is CancellationError {
             } catch {

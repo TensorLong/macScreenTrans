@@ -56,6 +56,22 @@ import Testing
     #expect(SenseGroupResponseRenderer.displayText(for: raw) == "意群: an ironic twist\n释义: 具有讽刺意味的转折")
 }
 
+@Test func senseGroupRendererAcceptsLegacyTranslationAliases() {
+    let raw = "{\"source_chunk\":\"given a sentence\",\"translation\":\"给定一个句子\"}"
+
+    #expect(SenseGroupResponseRenderer.displayText(for: raw) == "意群: given a sentence\n释义: 给定一个句子")
+}
+
+@Test func senseGroupRendererAcceptsChunkAliasAndMarkdownFence() {
+    let raw = """
+    ```json
+    {"chunk":"given a sentence","translation":"给定一个句子"}
+    ```
+    """
+
+    #expect(SenseGroupResponseRenderer.displayText(for: raw) == "意群: given a sentence\n释义: 给定一个句子")
+}
+
 @Test func senseGroupRendererKeepsPartialStreamVisible() {
     let raw = "{\"source_chunk\":\"an"
 
@@ -119,6 +135,14 @@ import Testing
     #expect(prompt.contains("source_chunk MUST be an exact substring"))
     #expect(prompt.contains("target_chunk MUST translate ONLY source_chunk"))
     #expect(prompt.contains("{\"source_chunk\":\"...\",\"target_chunk\":\"...\"}"))
+}
+
+@Test func translationOnlyPromptKeepsFallbackPlainTextContract() {
+    let prompt = PromptBuilder.translationOnlyPromptTemplate
+
+    #expect(prompt.contains("Translate the phrase"))
+    #expect(prompt.contains("Output ONLY the translated text"))
+    #expect(prompt.contains("No JSON"))
 }
 
 @Test func threeFingerTapDetectorRecognizesShortThreeFingerTouch() {
