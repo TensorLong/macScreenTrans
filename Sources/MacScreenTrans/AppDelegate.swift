@@ -1,6 +1,27 @@
 import AppKit
 import MacScreenTransCore
 
+/// Diagnostic logger used while hunting the duplicate-word anchor bug.
+/// Appends one line per call to `/tmp/macscreentrans-debug.log`. Remove
+/// this and its call sites once the root cause is fixed.
+fileprivate func dlog(_ line: String) {
+#if DEBUG
+    let stamp = ISO8601DateFormatter().string(from: Date())
+    let entry = "[\(stamp)] \(line)\n"
+    guard let data = entry.data(using: .utf8) else { return }
+    let url = URL(fileURLWithPath: "/tmp/macscreentrans-debug.log")
+    if !FileManager.default.fileExists(atPath: url.path) {
+        try? data.write(to: url)
+        return
+    }
+    if let handle = try? FileHandle(forWritingTo: url) {
+        defer { try? handle.close() }
+        _ = try? handle.seekToEnd()
+        try? handle.write(contentsOf: data)
+    }
+#endif
+}
+
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let trackpadMonitor = TrackpadTapMonitor()
@@ -22,6 +43,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private lazy var shortcutMonitor = GlobalShortcutMonitor()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        dlog("=== app launched pid=\(getpid()) ===")
         AppConfiguration.bootstrapDefaults()
         configureApplicationMenu()
         configureStatusItem()
@@ -168,8 +190,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         highlightOverlay.hide()
         phraseOverlay.hide()
         let point = NSEvent.mouseLocation
+        dlog("=== handleThreeFingerTap entered at point=\(point) ===")
 
         guard PermissionHelper.accessibilityTrusted else {
+            dlog("early-return: accessibility-not-trusted")
             PermissionHelper.promptForAccessibility()
             popup.show(
                 at: point,
@@ -190,21 +214,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case .text:
             break  // continue to resolve
         case .nonText(let role):
+            dlog("early-return: role-gate-nonText role=\(role)")
             popup.show(
                 at: point,
                 text: """
-                当前位置不是文本。
-                — 角色门控（v0.2.1 debug）—
-                role: \(role)
+                当前位置不是文本（role: \(role)）。
+                — 角色门控（v\(AppConfiguration.appVersion) debug）—
+                \(AXTextRoleProbe.lastTrace)
                 """
             )
             return
         case .failed(let reason):
+            dlog("early-return: role-probe-failed reason=\(reason.debugDescription)")
             popup.show(
                 at: point,
                 text: """
                 AX 角色探测失败。
-                — 角色门控（v0.2.1 debug）—
+                — 角色门控（v\(AppConfiguration.appVersion) debug）—
                 \(reason)
                 """
             )
@@ -212,19 +238,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         guard let result = AXWordReader.resolve(at: point) else {
+            dlog("early-return: resolve-nil ax_diagnostic=\(AXWordReader.lastDiagnostic.debugDescription)")
             popup.show(
                 at: point,
                 text: """
                 当前位置不支持取词。
                 请把鼠标放在可选择的正文或输入框文字上再试。
 
-                — AX 诊断（v0.2.1 debug）—
+                — AX 诊断（v\(AppConfiguration.appVersion) debug）—
                 \(AXWordReader.lastDiagnostic)
                 """
             )
             return
         }
         let selection = result.selection
+
+        dlog("--- new resolve ---")
+        dlog("word=\(selection.word.debugDescription)")
+        dlog("wordRangeInContext=\(selection.wordRangeInContext)")
+        dlog("wordRangeInSource=\(String(describing: selection.wordRangeInSource))")
+        dlog("context=\(selection.context.debugDescription)")
+        dlog("wordRect=\(String(describing: result.wordRect))")
+        dlog("clickedWordRangeInLookupText=\(String(describing: result.clickedWordRangeInLookupText))")
+        dlog("ax_diagnostic=\(AXWordReader.lastDiagnostic.debugDescription)")
+        let _ctxUTF16 = selection.context.utf16
+        let _s = selection.wordRangeInContext.lowerBound
+        let _e = selection.wordRangeInContext.upperBound
+        var _marked: String = selection.context
+        if _s >= 0, _e >= _s, _e <= _ctxUTF16.count {
+            let _sUTF16 = _ctxUTF16.index(_ctxUTF16.startIndex, offsetBy: _s)
+            let _eUTF16 = _ctxUTF16.index(_ctxUTF16.startIndex, offsetBy: _e)
+            if let _sIdx = _sUTF16.samePosition(in: selection.context),
+               let _eIdx = _eUTF16.samePosition(in: selection.context) {
+                _marked = selection.context[selection.context.startIndex..<_sIdx]
+                    + "«"
+                    + selection.context[_sIdx..<_eIdx]
+                    + "»"
+                    + selection.context[_eIdx..<selection.context.endIndex]
+            }
+        }
+        dlog("markedSentence=\(_marked.debugDescription)")
 
         // Show the popup anchored to the recognized word's screen rect when
         // AX gives us bounds. Otherwise fall back to the cursor — this still
@@ -245,7 +298,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         popup.update("正在解释：\(selection.word)\n\n")
         let lookupBox = PhraseLookupBox(result: result)
-        streamingTask = Task { [client, popup, phraseOverlay, highlightOverlay, lookupBox] in
+        // Compute the 3-word verbatim position string once per resolve.
+        // It accompanies the LLM payload AND drives the new range-anchor
+        // localisation in AXWordReader.phraseSegments — the cursor anchor
+        // expands from a single-word range to a 3-word neighbourhood, so
+        // any reasonable source_chunk that overlaps the neighbourhood
+        // passes cover. Wraps duplicate-word sentences where the LLM picks
+        // the right occurrence but the old single-word anchor was too
+        // narrow to recognise it.
+        let positionString = PromptBuilder.position(for: selection)
+        streamingTask = Task { [client, popup, phraseOverlay, highlightOverlay, lookupBox, positionString] in
             do {
                 var output = ""
                 for try await delta in client.streamExplanation(selection: selection, config: config) {
@@ -262,6 +324,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         popup.update("模型没有返回内容。")
                     }
                 } else if let response = SenseGroupResponseRenderer.response(for: output) {
+                    dlog("raw_output=\(output.debugDescription)")
+                    dlog("response.source=\(response.source.debugDescription)")
+                    dlog("response.target=\(response.target.debugDescription)")
                     // Reveal the green phrase overlay as soon as the LLM gives us
                     // a usable source phrase, regardless of whether we'll later
                     // fall through to the translation-only fallback. Per-line
@@ -273,7 +338,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     if !response.source.isEmpty {
                         let phrase = response.source
                         await MainActor.run {
-                            let segs = lookupBox.result.phraseSegments(for: phrase)
+                            let segs = lookupBox.result.phraseSegments(for: phrase, positionString: positionString)
+                            dlog("phrase=\(phrase.debugDescription) segs.count=\(segs.count)")
+                            for (i, seg) in segs.enumerated() {
+                                dlog("  seg[\(i)] rangeInElementText=\(seg.rangeInElementText) rect=\(seg.rect) text=\(seg.text.debugDescription)")
+                            }
+                            dlog("ax_diagnostic_after_segments=\(AXWordReader.lastDiagnostic.debugDescription)")
                             if !segs.isEmpty {
                                 let phraseFont: NSFont?
                                 if let wordRect = lookupBox.result.wordRect {
@@ -289,11 +359,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                 // space / odd web glyph — Issue 3). When
                                 // green segments DID resolve, slice the
                                 // matching segment proportionally to land
-                                // yellow on the word visually.
+                                // yellow on the word visually. We pass the
+                                // cursor anchor so a sentence with two of
+                                // the same word still gets yellow on the
+                                // occurrence the user pointed at.
                                 if lookupBox.result.wordRect == nil,
                                    let derivedRect = Self.deriveWordRectFromSegments(
                                     segments: segs,
-                                    word: selection.word
+                                    clickedWordRange: lookupBox.result.clickedWordRangeInLookupText
                                    ) {
                                     highlightOverlay.show(
                                         word: selection.word,
@@ -359,36 +432,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Belt-and-suspenders for Issue 3: when the AX layer failed to give us
     /// a word rect (soft wrap, zero-width-space glyphs, odd web glyphs),
-    /// but the green phrase segments DID resolve — scan segments for the
-    /// one whose text contains `word`, then proportionally slice that
-    /// segment's rect to estimate where the word sits inside it. The
-    /// slicing is character-index-based so it's only an approximation,
-    /// but it lands yellow on the visual word in the common case where
-    /// path-3 in `resolveWordRect` would otherwise put yellow on a
-    /// neighboring glyph.
+    /// but the green phrase segments DID resolve — pick the segment whose
+    /// UTF-16 range covers the cursor anchor, then proportionally slice
+    /// that segment's rect using the anchor's offset inside the segment.
+    /// The slicing is offset-based (not substring-based) so a sentence
+    /// like "set the timer and set the alarm" puts yellow on whichever
+    /// "set" the user actually pointed at, instead of always the first
+    /// occurrence the old `range(of: word)` shortcut returned.
     private static func deriveWordRectFromSegments(
         segments: [AXWordReader.PhraseSegment],
-        word: String
+        clickedWordRange: Range<Int>?
     ) -> NSRect? {
-        let needle = word.lowercased()
-        guard !needle.isEmpty else { return nil }
-        for seg in segments {
-            let hay = seg.text.lowercased()
-            guard let range = hay.range(of: needle) else { continue }
-            let totalCount = hay.count
-            guard totalCount > 0 else { continue }
-            let startIdx = hay.distance(from: hay.startIndex, to: range.lowerBound)
-            let endIdx = hay.distance(from: hay.startIndex, to: range.upperBound)
-            let relStart = CGFloat(startIdx) / CGFloat(totalCount)
-            let relEnd = CGFloat(endIdx) / CGFloat(totalCount)
-            return NSRect(
-                x: seg.rect.minX + seg.rect.width * relStart,
-                y: seg.rect.minY,
-                width: seg.rect.width * (relEnd - relStart),
-                height: seg.rect.height
-            )
+        guard let anchor = clickedWordRange, anchor.lowerBound < anchor.upperBound else {
+            return nil
         }
-        return nil
+
+        guard let seg = segments.first(where: {
+            $0.rangeInElementText.lowerBound <= anchor.lowerBound
+                && $0.rangeInElementText.upperBound >= anchor.upperBound
+        }) else { return nil }
+
+        let segSpan = seg.rangeInElementText.upperBound - seg.rangeInElementText.lowerBound
+        guard segSpan > 0 else { return nil }
+
+        let relStart = CGFloat(anchor.lowerBound - seg.rangeInElementText.lowerBound) / CGFloat(segSpan)
+        let relEnd = CGFloat(anchor.upperBound - seg.rangeInElementText.lowerBound) / CGFloat(segSpan)
+        return NSRect(
+            x: seg.rect.minX + seg.rect.width * relStart,
+            y: seg.rect.minY,
+            width: seg.rect.width * (relEnd - relStart),
+            height: seg.rect.height
+        )
     }
 
     private static func friendlyErrorMessage(for error: Error) -> String {

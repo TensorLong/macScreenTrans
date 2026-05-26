@@ -27,6 +27,7 @@ enum SelfTest {
 private final class SelfTestDelegate: NSObject, NSApplicationDelegate {
     private var window: NSWindow?
     private var textView: NSTextView?
+    private var button: NSButton?
     private static let probeText = "The quick brown fox jumps over the lazy dog right now"
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -46,6 +47,16 @@ private final class SelfTestDelegate: NSObject, NSApplicationDelegate {
         textView.textContainerInset = NSSize(width: 8, height: 8)
         self.textView = textView
 
+        // NSButton — v0.2.3 AXTextRoleProbe section uses it to validate
+        // the hard-exclude path. The probe was widened to accept
+        // `kAXValueAttribute` as String; without the AXButton hard-
+        // exclude, the button's title would falsely pass acceptance
+        // (Issue 5 false positive).
+        let button = NSButton(frame: NSRect(x: 20, y: 6, width: 100, height: 28))
+        button.title = "Save"
+        button.bezelStyle = .rounded
+        self.button = button
+
         let window = NSWindow(
             contentRect: NSRect(x: 300, y: 400, width: 760, height: 140),
             styleMask: [.titled],
@@ -55,6 +66,7 @@ private final class SelfTestDelegate: NSObject, NSApplicationDelegate {
         window.title = "MacScreenTrans Self-Test"
         textView.frame = NSRect(x: 20, y: 40, width: 720, height: 60)
         window.contentView?.addSubview(textView)
+        window.contentView?.addSubview(button)
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         self.window = window
@@ -157,13 +169,61 @@ private final class SelfTestDelegate: NSObject, NSApplicationDelegate {
         }
         print()
 
+        // v0.2.3 AXTextRoleProbe coverage. Closes the saved feedback gap
+        // ("--self-test only covers AX text-resolve, NOT role-gate").
+        // PASS criteria: probe(textView@middle) == .text (kAXTextArea),
+        // probe(button@middle) == .nonText (hard-exclude AXButton).
+        let textPoint = NSPoint(x: textOnScreen.midX, y: textOnScreen.midY)
+        let buttonInWindow = button?.convert(button?.bounds ?? .zero, to: nil) ?? .zero
+        let buttonOnScreen = window.convertToScreen(buttonInWindow)
+        let buttonPoint = NSPoint(x: buttonOnScreen.midX, y: buttonOnScreen.midY)
+
+        var roleProbeOK = true
+        print("--- probe[textView@middle] AppKit=(\(Int(textPoint.x)),\(Int(textPoint.y))) ---")
+        let textOutcome = AXTextRoleProbe.probe(at: textPoint)
+        switch textOutcome {
+        case .text:
+            print("✓ .text")
+        case .nonText(let role):
+            print("✗ expected .text, got .nonText(\(role))")
+            roleProbeOK = false
+        case .failed(let reason):
+            print("✗ expected .text, got .failed(\(reason))")
+            roleProbeOK = false
+        }
+        for line in AXTextRoleProbe.lastTrace.split(separator: "\n") {
+            print("  | \(line)")
+        }
+        print()
+
+        print("--- probe[button@middle] AppKit=(\(Int(buttonPoint.x)),\(Int(buttonPoint.y))) ---")
+        let btnOutcome = AXTextRoleProbe.probe(at: buttonPoint)
+        switch btnOutcome {
+        case .text:
+            print("✗ expected .nonText (button hard-exclude), got .text — FALSE POSITIVE")
+            roleProbeOK = false
+        case .nonText(let role):
+            print("✓ .nonText(\(role))")
+        case .failed(let reason):
+            // .failed is acceptable — means we didn't hit the button
+            // exactly (e.g., window not active). Note it but don't fail.
+            print("⚠ .failed(\(reason)) — accepted (window may not be frontmost)")
+        }
+        for line in AXTextRoleProbe.lastTrace.split(separator: "\n") {
+            print("  | \(line)")
+        }
+        print()
+
         print("=== Self-test summary ===")
         print("passed: \(passed)  failed: \(failed)")
         print("distinct words: \(distinctWords.count) — \(distinctWords.sorted().joined(separator: ", "))")
         print("phrase segments: \(phraseSegments.count) phrase OK: \(phraseOK)")
+        print("role probe OK: \(roleProbeOK)")
         let wordProbesPass = (failed == 0 && distinctWords.count >= 3)
-        if wordProbesPass && phraseOK {
-            print("VERDICT: PASS — word probes + phrase probe both succeeded")
+        if wordProbesPass && phraseOK && roleProbeOK {
+            print("VERDICT: PASS — word + phrase + role-probe all succeeded")
+        } else if wordProbesPass && phraseOK && !roleProbeOK {
+            print("VERDICT: REGRESSION-v0.2.3-role-probe — text-resolve pass but role-probe failed")
         } else if wordProbesPass && !phraseOK {
             print("VERDICT: REGRESSION-v0.2-phrase — word probes pass but phrase test failed")
         } else if failed == 0 && distinctWords.count == 1 {

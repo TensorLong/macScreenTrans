@@ -14,6 +14,13 @@ enum AXWordReader {
         /// single-line phrase this is the full phrase; for a multi-line
         /// phrase each line's slice is returned in a separate segment.
         let text: String
+        /// UTF-16 range of this segment's content inside `lookup.elementText`.
+        /// Lets fallback callers (e.g. `AppDelegate.deriveWordRectFromSegments`)
+        /// pick the segment whose range covers the clicked word's anchor,
+        /// rather than the first segment whose `text` happens to contain
+        /// the word substring — that older behavior mis-placed yellow on
+        /// duplicated words.
+        let rangeInElementText: Range<Int>
     }
 
     /// Opaque handle that captures everything we need to resolve phrase rects
@@ -36,6 +43,11 @@ enum AXWordReader {
         /// (context == elementText). Non-zero when we obtained context via
         /// `kAXStringForRange` over a sub-window.
         let contextOffsetInElement: Int
+        /// UTF-16 range of the clicked word inside `elementText`. This is
+        /// the cursor anchor — `phraseSegments` ranks phrase matches by
+        /// how well they cover or sit near this range, so duplicated-word
+        /// sentences no longer collapse to "first occurrence wins".
+        let clickedWordRangeInElementText: Range<Int>
     }
 
     struct Result {
@@ -44,6 +56,13 @@ enum AXWordReader {
         /// underlying element doesn't implement `kAXBoundsForRangeParameterizedAttribute`
         /// (image PDFs, custom-drawn UIs, some web views).
         let wordRect: NSRect?
+        /// Cursor anchor in the same coordinate space as `PhraseSegment.rangeInElementText`.
+        /// Overlay-fallback paths (e.g. `AppDelegate.deriveWordRectFromSegments`)
+        /// read this to slice the right segment when AX couldn't give us
+        /// a `wordRect` directly.
+        var clickedWordRangeInLookupText: Range<Int>? {
+            phraseLookup?.clickedWordRangeInElementText
+        }
         /// Internal — opaque handle for follow-up phrase lookups. Callers
         /// should call `phraseSegments(for:)` rather than touching this.
         fileprivate let phraseLookup: PhraseLookup?
@@ -68,8 +87,20 @@ enum AXWordReader {
         ///   4. If the per-character scan returns nothing, fall back to a
         ///      single `boundsForRange` rect, sanity-checked against a
         ///      single-char probe to refuse paragraph-tall rects.
-        func phraseSegments(for phrase: String) -> [PhraseSegment] {
-            AXWordReader.phraseSegments(for: phrase, lookup: phraseLookup, selection: selection)
+        ///
+        /// `positionString` is the 3-word verbatim substring of the LLM
+        /// payload's `sentence` field; when supplied, phrase localisation
+        /// uses it as the cursor anchor (a range that covers ANY character
+        /// in the source-chunk match passes the cover test) instead of the
+        /// narrow single-word anchor. Pass nil to keep the legacy single-
+        /// word anchor behavior.
+        func phraseSegments(for phrase: String, positionString: String? = nil) -> [PhraseSegment] {
+            AXWordReader.phraseSegments(
+                for: phrase,
+                lookup: phraseLookup,
+                selection: selection,
+                positionString: positionString
+            )
         }
     }
 
@@ -126,6 +157,12 @@ enum AXWordReader {
         // the selection. Stays nil when no text path applied.
         var lookupElementText: String?
         var lookupContextOffset: Int = 0
+        // UTF-16 range of the clicked word inside `lookupElementText`.
+        // Populated alongside the lookup so `PhraseLookup` can store the
+        // cursor anchor. Both branches set this; the default is harmless
+        // because `lookup` only gets built when `lookupElementText` is set.
+        var clickedWordOffsetInLookup: Int = 0
+        var clickedWordLength: Int = 0
 
         if let text = stringAttribute(element: element, attribute: kAXValueAttribute as String),
            let resolved = wordSelectionAround(
@@ -134,12 +171,22 @@ enum AXWordReader {
             radius: radius
            ) {
             selection = resolved.selection
-            let wordStart = absoluteWordStartUTF16Offset(
-                in: text,
-                pointedOffset: resolved.offset,
-                word: resolved.selection.word
-            ) ?? resolved.offset
-            wordUTF16Range = CFRange(location: wordStart, length: resolved.selection.word.utf16.count)
+            // Prefer `wordRangeInSource` — the extractor knows the word's
+            // absolute UTF-16 start in `text` directly. The legacy backward
+            // scan via `absoluteWordStartUTF16Offset` is kept as a defense
+            // for synthetic selections that don't populate the field.
+            let wordStart: Int
+            if let src = resolved.selection.wordRangeInSource {
+                wordStart = src.lowerBound
+            } else {
+                wordStart = absoluteWordStartUTF16Offset(
+                    in: text,
+                    pointedOffset: resolved.offset,
+                    word: resolved.selection.word
+                ) ?? resolved.offset
+            }
+            let wordLen = resolved.selection.word.utf16.count
+            wordUTF16Range = CFRange(location: wordStart, length: wordLen)
             // selection.context is a substring of `text`; recover the
             // context's absolute start by subtracting the word's relative
             // offset within context from its absolute offset within text.
@@ -148,6 +195,8 @@ enum AXWordReader {
                 0,
                 wordStart - resolved.selection.wordRangeInContext.lowerBound
             )
+            clickedWordOffsetInLookup = wordStart
+            clickedWordLength = wordLen
             diag.append("word=\"\(resolved.selection.word)\" via kAXValue (offset \(resolved.offset))")
         } else {
             let lower = max(0, pointedRange.location - radius)
@@ -163,31 +212,44 @@ enum AXWordReader {
                 return nil
             }
             selection = resolved.selection
+            // `wordRangeInSource` is the word's offset inside `context`
+            // (the AX window starting at `lower` in the element). The old
+            // code computed `lower + wordRangeInContext.lowerBound`, which
+            // silently assumed the sense-group context begins at the
+            // window's origin — a ±radius slice doesn't, so the word
+            // offset (and therefore yellow's position) could be off by
+            // the sense-group's start-within-window. Using `wordRangeInSource`
+            // when available makes the calculation actually correct on
+            // this path.
+            let wordOffsetInWindow: Int
+            if let src = resolved.selection.wordRangeInSource {
+                wordOffsetInWindow = src.lowerBound
+            } else {
+                wordOffsetInWindow = resolved.selection.wordRangeInContext.lowerBound
+            }
+            let wordLen = resolved.selection.word.utf16.count
             wordUTF16Range = CFRange(
-                location: lower + resolved.selection.wordRangeInContext.lowerBound,
-                length: resolved.selection.word.utf16.count
+                location: lower + wordOffsetInWindow,
+                length: wordLen
             )
             // The element doesn't expose its full text via kAXValue — we
             // only have a window obtained from `kAXStringForRange`. Treat
             // the window itself as our "element text" for phrase searches.
-            // The word lives at offset `wordRangeInContext.lowerBound`
-            // within `selection.context`, which is a substring of `context`
-            // (the window). Phrase queries outside the window will miss,
-            // but the window already covers ±radius around the word —
-            // wider than typical sense groups.
+            // Phrase queries outside the window will miss, but the window
+            // already covers ±radius around the word — wider than typical
+            // sense groups.
             lookupElementText = context
-            // Find the actual offset of the WordSelection.context substring
-            // within the window. Falls back to 0 when the substring isn't
-            // located exactly (shouldn't happen — extractor guarantees it).
-            if let range = context.range(of: resolved.selection.context) {
-                let offset = context.utf16.distance(
-                    from: context.utf16.startIndex,
-                    to: range.lowerBound.samePosition(in: context.utf16) ?? context.utf16.startIndex
-                )
-                lookupContextOffset = max(0, offset)
-            } else {
-                lookupContextOffset = 0
-            }
+            // Sense-group context starts at `wordOffsetInWindow -
+            // wordRangeInContext.lowerBound` inside the window. The
+            // previous `context.range(of: selection.context)` did the
+            // same thing via substring search, but that picked the
+            // first occurrence — wrong when the sense-group text repeats.
+            lookupContextOffset = max(
+                0,
+                wordOffsetInWindow - resolved.selection.wordRangeInContext.lowerBound
+            )
+            clickedWordOffsetInLookup = wordOffsetInWindow
+            clickedWordLength = wordLen
             diag.append("word=\"\(resolved.selection.word)\" via kAXStringForRange (offset \(resolved.offset))")
         }
 
@@ -209,10 +271,13 @@ enum AXWordReader {
         // word, which is almost always wider than the LLM's sense group).
         let lookup: PhraseLookup?
         if let lookupElementText {
+            let anchorStart = max(0, min(clickedWordOffsetInLookup, lookupElementText.utf16.count))
+            let anchorEnd = max(anchorStart, min(anchorStart + clickedWordLength, lookupElementText.utf16.count))
             lookup = PhraseLookup(
                 element: element,
                 elementText: lookupElementText,
-                contextOffsetInElement: lookupContextOffset
+                contextOffsetInElement: lookupContextOffset,
+                clickedWordRangeInElementText: anchorStart..<anchorEnd
             )
         } else {
             lookup = nil
@@ -225,7 +290,8 @@ enum AXWordReader {
     fileprivate static func phraseSegments(
         for phrase: String,
         lookup: PhraseLookup?,
-        selection: WordSelection
+        selection: WordSelection,
+        positionString: String? = nil
     ) -> [PhraseSegment] {
         var diag: [String] = []
         defer {
@@ -249,21 +315,46 @@ enum AXWordReader {
         }
 
         // Step 1: locate `phrase` as a UTF-16 range inside `lookup.elementText`.
-        // Two-stage: exact substring (preferring the context window), then
-        // normalized fuzzy match.
+        // Two-stage: exact substring, then normalized fuzzy match. Both
+        // stages enumerate ALL matches and pick the one that best lines
+        // up with the cursor anchor.
+        //
+        // When `positionString` is supplied (the LLM payload's `position`
+        // field), we first localise that 3-word verbatim substring inside
+        // elementText and use IT as the anchor — any source_chunk match
+        // overlapping any character of position passes the cover test.
+        // This is the design fix for sentences where the same word appears
+        // multiple times: the old single-word anchor was too narrow for
+        // cover, so green sometimes landed on the wrong occurrence even
+        // though the LLM picked the right one.
+        let wordAnchor = lookup.clickedWordRangeInElementText
+        let positionRange: Range<Int>? = positionString.flatMap { pos in
+            locatePositionRange(
+                pos,
+                in: lookup.elementText,
+                fallbackWordRange: wordAnchor
+            )
+        }
+        if let positionRange {
+            diag.append("posAnchor=\(positionRange.lowerBound)..<\(positionRange.upperBound)")
+        } else if positionString != nil {
+            diag.append("posAnchor=miss")
+        }
         let phraseRange: CFRange
         let hitKind: String
         if let exact = locateExactRange(
             phrase: phrase,
             elementText: lookup.elementText,
-            preferStart: lookup.contextOffsetInElement,
-            preferLength: selection.context.utf16.count
+            wordAnchor: wordAnchor,
+            positionAnchor: positionRange
         ) {
             phraseRange = exact
             hitKind = "exact"
         } else if let fuzzy = locateFuzzyRange(
             phrase: phrase,
-            elementText: lookup.elementText
+            elementText: lookup.elementText,
+            wordAnchor: wordAnchor,
+            positionAnchor: positionRange
         ) {
             phraseRange = fuzzy
             hitKind = "fuzzy"
@@ -272,7 +363,7 @@ enum AXWordReader {
             return []
         }
         diag.append("hit=\(hitKind)")
-        diag.append("range=loc=\(phraseRange.location) len=\(phraseRange.length)")
+        diag.append("range=loc=\(phraseRange.location) len=\(phraseRange.length) anchor=\(wordAnchor.lowerBound)..<\(wordAnchor.upperBound)")
 
         // Step 2: split per visual line by Y-clustering per-character bounds.
         // This works on WebKit too, where the older kAXLineForIndex /
@@ -319,21 +410,74 @@ enum AXWordReader {
             }
             let text = substring(of: lookup.elementText, utf16Range: phraseRange) ?? phrase
             diag.append("lines=fallback segs=1")
-            return [PhraseSegment(rect: rect, text: text)]
+            let fallbackRange = phraseRange.location..<(phraseRange.location + phraseRange.length)
+            return [PhraseSegment(rect: rect, text: text, rangeInElementText: fallbackRange)]
         }
 
         diag.append("lines=none segs=0")
         return []
     }
 
-    /// Try exact substring search. We prefer hits that fall inside the original
-    /// context window (so we anchor against the sense group the user actually
-    /// pointed at, not a different occurrence elsewhere in a long doc).
+    /// Locate the verbatim `position` substring inside `elementText`.
+    ///   - If `position` appears exactly once, return that range.
+    ///   - If it appears multiple times, return the match that fully
+    ///     contains `fallbackWordRange` (the AX single-word anchor). When
+    ///     none of the matches contain the word range, return nil so the
+    ///     caller falls back to the existing single-word anchor path.
+    /// The returned range is UTF-16-offset based (same coordinate space
+    /// as `elementText.utf16`).
+    static func locatePositionRange(
+        _ position: String,
+        in elementText: String,
+        fallbackWordRange: Range<Int>?
+    ) -> Range<Int>? {
+        let elementUTF16Count = elementText.utf16.count
+        guard elementUTF16Count > 0 else { return nil }
+
+        let positionUTF16Count = position.utf16.count
+        guard positionUTF16Count > 0, positionUTF16Count <= elementUTF16Count else { return nil }
+
+        let starts = allExactMatchStarts(
+            of: position,
+            in: elementText,
+            needleLength: positionUTF16Count,
+            haystackLength: elementUTF16Count
+        )
+        guard !starts.isEmpty else { return nil }
+
+        if starts.count == 1 {
+            let s = starts[0]
+            return s..<(s + positionUTF16Count)
+        }
+
+        // Multiple verbatim matches (rare with a 3-word verbatim string):
+        // pick the one that fully contains the AX single-word anchor.
+        guard let fallback = fallbackWordRange,
+              fallback.lowerBound < fallback.upperBound else {
+            return nil
+        }
+        for s in starts {
+            let end = s + positionUTF16Count
+            if s <= fallback.lowerBound && end >= fallback.upperBound {
+                return s..<end
+            }
+        }
+        return nil
+    }
+
+    /// Exact substring search over the whole element text. Returns the
+    /// occurrence that best lines up with the cursor anchor. When a
+    /// position-range anchor is supplied, cover = any character-level
+    /// overlap with the position range and nearest = range-to-range
+    /// distance. When no position-range is supplied, falls back to the
+    /// legacy single-word anchor (cover = match fully contains the word,
+    /// nearest = match-start vs. word-start distance).
+    /// Returns nil when the phrase doesn't appear at all.
     private static func locateExactRange(
         phrase: String,
         elementText: String,
-        preferStart: Int,
-        preferLength: Int
+        wordAnchor: Range<Int>,
+        positionAnchor: Range<Int>?
     ) -> CFRange? {
         let elementUTF16Count = elementText.utf16.count
         guard elementUTF16Count > 0 else { return nil }
@@ -341,33 +485,33 @@ enum AXWordReader {
         let phraseUTF16Count = phrase.utf16.count
         guard phraseUTF16Count > 0, phraseUTF16Count <= elementUTF16Count else { return nil }
 
-        // Search within the context window first — clamp inputs so an
-        // overlong/negative preferStart doesn't blow up the substring math.
-        let windowStart = max(0, min(preferStart, elementUTF16Count))
-        let windowEnd = max(windowStart, min(elementUTF16Count, preferStart + max(preferLength, 0)))
-        if windowEnd > windowStart,
-           let window = substring(of: elementText, utf16Range: CFRange(location: windowStart, length: windowEnd - windowStart)),
-           let relative = window.range(of: phrase) {
-            let relativeOffset = window.utf16.distance(from: window.utf16.startIndex, to: relative.lowerBound.samePosition(in: window.utf16) ?? window.utf16.startIndex)
-            return CFRange(location: windowStart + relativeOffset, length: phraseUTF16Count)
-        }
+        let matches = allExactMatchStarts(
+            of: phrase,
+            in: elementText,
+            needleLength: phraseUTF16Count,
+            haystackLength: elementUTF16Count
+        )
+        guard !matches.isEmpty else { return nil }
 
-        // Fall back to whole-element search.
-        if let match = elementText.range(of: phrase) {
-            let offset = elementText.utf16.distance(from: elementText.utf16.startIndex, to: match.lowerBound.samePosition(in: elementText.utf16) ?? elementText.utf16.startIndex)
-            return CFRange(location: offset, length: phraseUTF16Count)
+        let ranges = matches.map { CFRange(location: $0, length: phraseUTF16Count) }
+        if let positionAnchor {
+            return pickBestRange(matches: ranges, positionAnchor: positionAnchor)
         }
-        return nil
+        return pickBestRange(matches: ranges, anchor: wordAnchor)
     }
 
     /// Normalize both haystack and needle (lowercase, collapse whitespace
     /// runs to a single space, strip ASCII punctuation) and search again.
-    /// When a normalized match exists, walk the original-index map we built
-    /// during normalization to recover a CFRange in the ORIGINAL UTF-16
-    /// coordinate system.
+    /// Enumerates EVERY normalized match, maps each back to the original
+    /// UTF-16 range via the normalization index map, then picks the
+    /// occurrence that best aligns with the cursor anchor — same ranking
+    /// rules as `locateExactRange`, including the position-range anchor
+    /// when provided.
     private static func locateFuzzyRange(
         phrase: String,
-        elementText: String
+        elementText: String,
+        wordAnchor: Range<Int>,
+        positionAnchor: Range<Int>?
     ) -> CFRange? {
         let normalizedPhrase = normalize(phrase)
         guard !normalizedPhrase.text.isEmpty else { return nil }
@@ -378,37 +522,166 @@ enum AXWordReader {
             return nil
         }
 
-        guard let hit = normalizedElement.text.range(of: normalizedPhrase.text) else {
-            return nil
+        let needleUTF16Count = normalizedPhrase.text.utf16.count
+        let haystackUTF16Count = normalizedElement.text.utf16.count
+        let normalizedStarts = allExactMatchStarts(
+            of: normalizedPhrase.text,
+            in: normalizedElement.text,
+            needleLength: needleUTF16Count,
+            haystackLength: haystackUTF16Count
+        )
+        guard !normalizedStarts.isEmpty else { return nil }
+
+        // Map every normalized match back to its original UTF-16 range.
+        // The index map has one entry per normalized UTF-16 unit pointing
+        // at the source offset of that unit; the end index uses the last
+        // consumed unit + 1 (or clamps to elementText length).
+        let elementUTF16Count = elementText.utf16.count
+        var originalRanges: [CFRange] = []
+        originalRanges.reserveCapacity(normalizedStarts.count)
+        for normStart in normalizedStarts {
+            let normEnd = normStart + needleUTF16Count
+            guard normStart >= 0, normStart < normalizedElement.indexMap.count,
+                  normEnd > 0, normEnd <= normalizedElement.indexMap.count else {
+                continue
+            }
+            let originalStart = normalizedElement.indexMap[normStart]
+            let originalEnd: Int
+            if normEnd - 1 < normalizedElement.indexMap.count {
+                originalEnd = normalizedElement.indexMap[normEnd - 1] + 1
+            } else {
+                originalEnd = elementUTF16Count
+            }
+            let length = max(0, originalEnd - originalStart)
+            guard length > 0 else { continue }
+            originalRanges.append(CFRange(location: originalStart, length: length))
         }
-        let normStart = normalizedElement.text.utf16.distance(
-            from: normalizedElement.text.utf16.startIndex,
-            to: hit.lowerBound.samePosition(in: normalizedElement.text.utf16) ?? normalizedElement.text.utf16.startIndex
-        )
-        let normEnd = normalizedElement.text.utf16.distance(
-            from: normalizedElement.text.utf16.startIndex,
-            to: hit.upperBound.samePosition(in: normalizedElement.text.utf16) ?? normalizedElement.text.utf16.startIndex
-        )
-        guard normStart < normalizedElement.indexMap.count,
-              normEnd > 0,
-              normEnd <= normalizedElement.indexMap.count else {
-            return nil
+        if let positionAnchor {
+            return pickBestRange(matches: originalRanges, positionAnchor: positionAnchor)
+        }
+        return pickBestRange(matches: originalRanges, anchor: wordAnchor)
+    }
+
+    /// All start offsets where `needle` occurs in `haystack`, comparing
+    /// UTF-16 units directly so combining sequences / pre-composed forms
+    /// aren't accidentally folded together. Reports overlapping matches
+    /// (e.g. "ana" in "banana") — overlapping matches are vanishingly rare
+    /// for real sense-group phrases, but reporting them keeps the ranking
+    /// stage's input complete.
+    static func allExactMatchStarts(
+        of needle: String,
+        in haystack: String,
+        needleLength: Int,
+        haystackLength: Int
+    ) -> [Int] {
+        guard needleLength > 0, haystackLength >= needleLength else { return [] }
+        let hay = Array(haystack.utf16)
+        let pat = Array(needle.utf16)
+        guard pat.count == needleLength, hay.count == haystackLength else { return [] }
+
+        var out: [Int] = []
+        let limit = hay.count - pat.count
+        var i = 0
+        while i <= limit {
+            var matched = true
+            for j in 0..<pat.count {
+                if hay[i + j] != pat[j] {
+                    matched = false
+                    break
+                }
+            }
+            if matched {
+                out.append(i)
+            }
+            i += 1
+        }
+        return out
+    }
+
+    /// Picks the match that best lines up with the cursor anchor. Cover
+    /// beats distance: a match whose UTF-16 range fully covers the anchor
+    /// word always wins over a non-covering one, even when a non-covering
+    /// match starts closer to the anchor (the user pointed at this exact
+    /// span, not at a neighbor that happens to be near it). Among non-
+    /// covering matches we pick the smallest absolute distance from the
+    /// match's start to the anchor's start.
+    static func pickBestRange(matches: [CFRange], anchor: Range<Int>) -> CFRange? {
+        guard !matches.isEmpty else { return nil }
+
+        for m in matches {
+            let mEnd = m.location + m.length
+            if m.location <= anchor.lowerBound && mEnd >= anchor.upperBound {
+                return m
+            }
         }
 
-        // Map normalized offsets back to original UTF-16 offsets. The
-        // index map has one entry per normalized UTF-16 unit, pointing to
-        // its origin in the source text. End index uses the last consumed
-        // unit + 1 (or clamps to elementText length).
-        let originalStart = normalizedElement.indexMap[normStart]
-        let originalEnd: Int
-        if normEnd - 1 < normalizedElement.indexMap.count {
-            originalEnd = normalizedElement.indexMap[normEnd - 1] + 1
-        } else {
-            originalEnd = elementText.utf16.count
+        var best = matches[0]
+        var bestDistance = abs(best.location - anchor.lowerBound)
+        for m in matches.dropFirst() {
+            let d = abs(m.location - anchor.lowerBound)
+            if d < bestDistance {
+                best = m
+                bestDistance = d
+            }
         }
-        let length = max(0, originalEnd - originalStart)
-        guard length > 0 else { return nil }
-        return CFRange(location: originalStart, length: length)
+        return best
+    }
+
+    /// Range-anchor variant of `pickBestRange`. Cover = any character-level
+    /// overlap between the match range and the position anchor range
+    /// (i.e. match.start < anchor.end && anchor.start < match.end). Among
+    /// non-overlapping matches, the winner is the one whose range is
+    /// closest in UTF-16 distance to the position anchor — distance is the
+    /// gap between the two ranges (0 if they touch, positive when they
+    /// don't overlap).
+    ///
+    /// This is the localisation policy for the new `position` design: any
+    /// reasonable LLM source_chunk that overlaps the user's pointed
+    /// 3-word neighbourhood passes the cover test, so duplicate-word
+    /// sentences no longer collapse to "first occurrence wins". The
+    /// nearest fallback remains as a localisation policy (carried over
+    /// from the single-word anchor era), not a new bandaid for LLM
+    /// failures.
+    static func pickBestRange(matches: [CFRange], positionAnchor anchor: Range<Int>) -> CFRange? {
+        guard !matches.isEmpty else { return nil }
+
+        for m in matches {
+            let mStart = m.location
+            let mEnd = m.location + m.length
+            if mStart < anchor.upperBound && anchor.lowerBound < mEnd {
+                return m
+            }
+        }
+
+        // No overlap with any match — pick the match whose range is
+        // closest to the anchor range. Distance is the gap between the
+        // two ranges: 0 when they touch, positive otherwise.
+        var best = matches[0]
+        var bestDistance = rangeDistance(matchStart: best.location, matchEnd: best.location + best.length, anchor: anchor)
+        for m in matches.dropFirst() {
+            let d = rangeDistance(matchStart: m.location, matchEnd: m.location + m.length, anchor: anchor)
+            if d < bestDistance {
+                best = m
+                bestDistance = d
+            }
+        }
+        return best
+    }
+
+    /// UTF-16 gap between a match range `[matchStart, matchEnd)` and an
+    /// anchor range. 0 if they touch or overlap (but `pickBestRange` has
+    /// already taken the overlap branch when we get here), positive
+    /// otherwise.
+    private static func rangeDistance(matchStart: Int, matchEnd: Int, anchor: Range<Int>) -> Int {
+        if matchEnd <= anchor.lowerBound {
+            return anchor.lowerBound - matchEnd
+        }
+        if matchStart >= anchor.upperBound {
+            return matchStart - anchor.upperBound
+        }
+        // Overlapping — should not normally reach here from pickBestRange,
+        // but report 0 as the canonical "touching" distance.
+        return 0
     }
 
     /// Normalization output: the cleaned string plus a parallel array mapping
@@ -636,7 +909,9 @@ enum AXWordReader {
         let clusters = clusterByVisualLine(chars)
         guard !clusters.isEmpty else { return nil }
 
-        return clusters.map { PhraseSegment(rect: $0.rect, text: $0.text) }
+        return clusters.map {
+            PhraseSegment(rect: $0.rect, text: $0.text, rangeInElementText: $0.range)
+        }
     }
 
     private static func rangeForPosition(element: AXUIElement, point: CGPoint) -> CFRange? {
@@ -762,12 +1037,18 @@ enum AXWordReader {
     /// Group a list of per-character rects into visual lines. Walks the
     /// rects in offset order; when a char's vertical position jumps more
     /// than `0.5 × medianHeight` from the current cluster's first char, we
-    /// close the cluster and start a new one. Returns one entry per cluster:
-    /// the union of horizontal extent (height taken from the cluster's
-    /// own union) and the concatenation of the cluster's glyphs.
+    /// close the cluster and start a new one. Returns one entry per cluster
+    /// with: the union of horizontal extent (height from the cluster's own
+    /// union), the concatenation of the cluster's glyphs, and the smallest
+    /// UTF-16 range that covers every glyph in the cluster (in the same
+    /// coordinate space as the offsets fed in). The range is what lets
+    /// `perLineSegments` and downstream overlay-fallback code tell which
+    /// cluster the clicked word belongs to — without it they'd be back to
+    /// substring-matching the cluster text and re-introducing the
+    /// duplicated-word bug.
     static func clusterByVisualLine(
         _ chars: [(offset: Int, rect: NSRect, glyph: String)]
-    ) -> [(rect: NSRect, text: String)] {
+    ) -> [(rect: NSRect, text: String, range: Range<Int>)] {
         guard !chars.isEmpty else { return [] }
         let sorted = chars.sorted { $0.offset < $1.offset }
 
@@ -799,16 +1080,23 @@ enum AXWordReader {
             clusters.append(current)
         }
 
-        var out: [(rect: NSRect, text: String)] = []
+        var out: [(rect: NSRect, text: String, range: Range<Int>)] = []
         out.reserveCapacity(clusters.count)
         for cluster in clusters {
-            guard let first = cluster.first else { continue }
+            guard let first = cluster.first, let last = cluster.last else { continue }
             var union = first.rect
             for entry in cluster.dropFirst() {
                 union = union.union(entry.rect)
             }
             let text = cluster.map(\.glyph).joined()
-            out.append((union, text))
+            // Span the smallest contiguous UTF-16 range covering every
+            // unit in the cluster. `scanCharacterRects` may skip units
+            // that returned nil bounds (zero-width / control glyphs), so
+            // the actual cluster.text can be shorter than this span —
+            // that's fine, downstream callers only need the range to
+            // decide containment, not to slice text by it.
+            let range = first.offset..<(last.offset + 1)
+            out.append((union, text, range))
         }
         return out
     }

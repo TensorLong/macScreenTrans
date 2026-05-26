@@ -11,6 +11,15 @@ final class FloatingTranslationWindowController {
     private static let contentInset: CGFloat = 14
     private static let popupWidth: CGFloat = 390
     private static let popupHeight: CGFloat = 230
+    private static let panelHeight = popupHeight + tailHeight
+    // Mirrors the highlight overlays' insetBy(dy: -2). Keep in sync if changed.
+    private static let highlightVerticalOverhang: CGFloat = 2
+    // The yellow/green bubbles also redraw their text 1.05× scaled + lifted
+    // 2pt, which makes their visible top edge ~3.5pt above the segment for
+    // short glyphs. Apple's Look Up leaves ~8pt of breathing room between
+    // tail tip and the underlined word — match that, not the bubble's raw
+    // overhang.
+    private static let tipClearanceFromHighlight: CGFloat = 8
 
     private let panel: NSPanel
     private let statusLabel = NSTextField(labelWithString: "Ready")
@@ -26,12 +35,36 @@ final class FloatingTranslationWindowController {
     nonisolated(unsafe) private var globalKeyMonitor: Any?
     nonisolated(unsafe) private var globalMouseMonitor: Any?
 
+    /// Frozen at `show(anchoredTo:)`. The edge of the panel adjacent to the
+    /// word is pinned at `pinnedScreenY` in screen coordinates; subsequent
+    /// `update(_:)` calls reflow the panel keeping that edge fixed, so the
+    /// body can only grow in the direction AWAY from the word, up to
+    /// `maxHeight`. Nil when the popup is shown via the cursor fallback
+    /// `show(at:)`.
+    private struct AnchorState {
+        /// True when the bubble sits above the word (tail points DOWN).
+        let isAbove: Bool
+        /// Screen-Y of the edge that's pinned next to the word:
+        ///   - isAbove=true  → panel.minY  (bubble bottom)
+        ///   - isAbove=false → panel.maxY  (bubble top)
+        let pinnedScreenY: CGFloat
+        /// Panel origin.x — locked once at show; never changes.
+        let originX: CGFloat
+        /// Hard cap on panel height: distance from the pinned edge to the
+        /// screen's far edge, minus padding. The body never exceeds this.
+        let maxHeight: CGFloat
+        /// Tail geometry, also frozen at show.
+        let tailConfig: BubbleBackgroundView.TailConfig
+    }
+
+    private var anchorState: AnchorState?
+
     init() {
         let initialFrame = NSRect(
             x: 0,
             y: 0,
             width: Self.popupWidth,
-            height: Self.popupHeight
+            height: Self.panelHeight
         )
         panel = NSPanel(
             contentRect: initialFrame,
@@ -39,7 +72,10 @@ final class FloatingTranslationWindowController {
             backing: .buffered,
             defer: false
         )
-        panel.level = .floating
+        // .popUpMenu (same as yellow word highlight) so the green phrase
+        // overlay at .floating can never z-order on top of us and cover
+        // the tail tip.
+        panel.level = .popUpMenu
         panel.collectionBehavior = [.canJoinAllSpaces, .transient]
         panel.backgroundColor = .clear
         panel.isOpaque = false
@@ -49,6 +85,16 @@ final class FloatingTranslationWindowController {
         panel.hidesOnDeactivate = false
         panel.isMovableByWindowBackground = true
         panel.animationBehavior = .utilityWindow
+        // Lock the panel size. Without this, NSWindow auto-resizes its frame
+        // when the contentView's AutoLayout fitting size grows (e.g. the
+        // NSTextView inside the scroll view inflates as streaming tokens
+        // arrive). The default anchoring is top-left, so panel.maxY stays
+        // put while panel.minY drifts down — and panel.minY is exactly the
+        // edge we pinned to the word. min==max forbids any AppKit-driven
+        // resize, so the frame can only change when we call setFrame.
+        let lockedPanelSize = NSSize(width: Self.popupWidth, height: Self.panelHeight)
+        panel.minSize = lockedPanelSize
+        panel.maxSize = lockedPanelSize
 
         bubbleBackground = BubbleBackgroundView(frame: initialFrame)
         panel.contentView = bubbleBackground
@@ -113,7 +159,15 @@ final class FloatingTranslationWindowController {
 
         contentStack.addArrangedSubview(scrollView)
         scrollView.widthAnchor.constraint(equalTo: contentStack.widthAnchor).isActive = true
-        scrollView.heightAnchor.constraint(greaterThanOrEqualToConstant: 96).isActive = true
+        scrollView.setContentHuggingPriority(.defaultLow, for: .vertical)
+        scrollView.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
+
+        let minimumScrollHeight = scrollView.heightAnchor.constraint(greaterThanOrEqualToConstant: 44)
+        minimumScrollHeight.isActive = true
+
+        let preferredScrollHeight = scrollView.heightAnchor.constraint(greaterThanOrEqualToConstant: 96)
+        preferredScrollHeight.priority = .defaultLow
+        preferredScrollHeight.isActive = true
 
         bubbleBackground.applyContentConstraints(
             fillView: opaqueFill,
@@ -133,9 +187,12 @@ final class FloatingTranslationWindowController {
     }
 
     func show(at point: CGPoint, text: String) {
+        // Non-anchored: no edge to pin. Clear state so update() doesn't try
+        // to reflow against stale geometry.
+        anchorState = nil
         update(text)
         bubbleBackground.tailConfig = nil
-        let size = NSSize(width: Self.popupWidth, height: Self.popupHeight)
+        let size = NSSize(width: Self.popupWidth, height: Self.panelHeight)
         let origin = origin(near: point, size: size)
         panel.setFrame(NSRect(origin: origin, size: size), display: true)
         panel.orderFrontRegardless()
@@ -143,43 +200,87 @@ final class FloatingTranslationWindowController {
     }
 
     /// Show the popup as a speech bubble anchored to `wordRect` (AppKit
-    /// screen coords). Tail points DOWN at the word when the bubble is
-    /// above, UP when below.
+    /// screen coords). The above/below side is decided ONCE here and
+    /// frozen in `anchorState` — subsequent `update(_:)` calls reflow the
+    /// panel keeping the edge adjacent to the word pinned in place, so the
+    /// body can only grow AWAY from the anchor. Tail points DOWN at the
+    /// word when the bubble is above, UP when below.
     func show(anchoredTo wordRect: NSRect, text: String) {
-        update(text)
-
         let screenFrame = (NSScreen.screens.first {
             NSMouseInRect(CGPoint(x: wordRect.midX, y: wordRect.midY), $0.frame, false)
         } ?? NSScreen.main)?.visibleFrame ?? .zero
 
-        // Include the tail in the panel size so the bubble path has room
-        // to draw both the body and the triangle.
-        let size = NSSize(
-            width: Self.popupWidth,
-            height: Self.popupHeight + Self.tailHeight
-        )
         let verticalGap: CGFloat = 2
-        let placement = ScreenCoordinateConverter.popupPlacement(
-            wordRect: wordRect,
-            popupSize: size,
-            screenVisibleFrame: screenFrame,
-            verticalGap: verticalGap
+        let edgePadding: CGFloat = 8
+
+        // Inset the anchor so the tail tip lands outside the yellow/green
+        // highlight overhang above the word.
+        let anchorRect = wordRect.insetBy(
+            dx: 0,
+            dy: -(Self.highlightVerticalOverhang + Self.tipClearanceFromHighlight)
         )
 
-        // Constrain tailX so the tail can still draw a clean triangle near
-        // the bubble's rounded corners.
-        let minTail = Self.cornerRadius + Self.tailHalfBase + 2
-        let maxTail = size.width - Self.cornerRadius - Self.tailHalfBase - 2
-        let tailX = max(minTail, min(maxTail, placement.tailX))
+        // Decide side once. Apple's Look Up prefers above; we fall back
+        // below only when above doesn't fit the ideal height. Once chosen,
+        // the side never flips mid-stream — VSCode (#109226) learned the
+        // hard way that mid-stream flips cause the popup to jump under
+        // the cursor.
+        let idealHeight = Self.panelHeight
+        let aboveSpace = screenFrame.maxY - (anchorRect.maxY + verticalGap) - edgePadding
+        let belowSpace = (anchorRect.minY - verticalGap) - screenFrame.minY - edgePadding
 
-        bubbleBackground.tailConfig = BubbleBackgroundView.TailConfig(
-            edge: placement.isAboveWord ? .bottom : .top,
+        let isAbove: Bool
+        if aboveSpace >= idealHeight {
+            isAbove = true
+        } else if belowSpace >= idealHeight {
+            isAbove = false
+        } else {
+            isAbove = aboveSpace >= belowSpace
+        }
+
+        // Pin the edge adjacent to the word. The body may only grow in
+        // the direction AWAY from `pinnedScreenY`.
+        let pinnedScreenY: CGFloat
+        let maxHeight: CGFloat
+        if isAbove {
+            pinnedScreenY = anchorRect.maxY + verticalGap  // panel.minY
+            maxHeight = max(idealHeight, aboveSpace)
+        } else {
+            pinnedScreenY = anchorRect.minY - verticalGap  // panel.maxY
+            maxHeight = max(idealHeight, belowSpace)
+        }
+
+        // Lock X centering once. tailX is the tail tip's horizontal offset
+        // inside the panel; clamp so the triangle clears the rounded
+        // corners.
+        let wordCenterX = wordRect.midX
+        var originX = wordCenterX - Self.popupWidth / 2
+        originX = max(screenFrame.minX + edgePadding, originX)
+        originX = min(screenFrame.maxX - Self.popupWidth - edgePadding, originX)
+
+        let minTail = Self.cornerRadius + Self.tailHalfBase + 2
+        let maxTail = Self.popupWidth - Self.cornerRadius - Self.tailHalfBase - 2
+        let tailX = max(minTail, min(maxTail, wordCenterX - originX))
+
+        let tailConfig = BubbleBackgroundView.TailConfig(
+            edge: isAbove ? .bottom : .top,
             tailX: tailX,
             tailHeight: Self.tailHeight,
             tailHalfBase: Self.tailHalfBase,
             cornerRadius: Self.cornerRadius
         )
-        panel.setFrame(NSRect(origin: placement.origin, size: size), display: true)
+        bubbleBackground.tailConfig = tailConfig
+
+        anchorState = AnchorState(
+            isAbove: isAbove,
+            pinnedScreenY: pinnedScreenY,
+            originX: originX,
+            maxHeight: maxHeight,
+            tailConfig: tailConfig
+        )
+
+        // update() runs reflowAnchoredFrame() which calls setFrame.
+        update(text)
         panel.orderFrontRegardless()
         dismissArmedAt = Date().addingTimeInterval(0.25)
     }
@@ -195,6 +296,38 @@ final class FloatingTranslationWindowController {
         sourceStack.isHidden = parsed.word.isEmpty
         targetTextView.string = parsed.target
         targetTextView.scrollToEndOfDocument(nil)
+
+        if let state = anchorState {
+            reflowAnchoredFrame(state: state)
+        }
+    }
+
+    /// Recompute the anchored panel's frame using the frozen `state`. The
+    /// edge adjacent to the word (`state.pinnedScreenY`) NEVER moves —
+    /// the far edge does, clamped by `state.maxHeight`. This is the
+    /// geometric invariant that guarantees the body can never cross
+    /// into the word, no matter how much streaming content arrives.
+    private func reflowAnchoredFrame(state: AnchorState) {
+        let height = min(state.maxHeight, Self.panelHeight)
+
+        let originY: CGFloat
+        if state.isAbove {
+            // panel.minY is pinned; panel grows upward away from the word.
+            originY = state.pinnedScreenY
+        } else {
+            // panel.maxY is pinned; panel grows downward away from the word.
+            originY = state.pinnedScreenY - height
+        }
+
+        let newFrame = NSRect(
+            x: state.originX,
+            y: originY,
+            width: Self.popupWidth,
+            height: height
+        )
+        if !panel.frame.equalTo(newFrame) {
+            panel.setFrame(newFrame, display: true)
+        }
     }
 
     func append(_ delta: String) {
@@ -203,6 +336,7 @@ final class FloatingTranslationWindowController {
 
     func close() {
         guard panel.isVisible else { return }
+        anchorState = nil
         panel.orderOut(nil)
         onCloseHandler?()
     }

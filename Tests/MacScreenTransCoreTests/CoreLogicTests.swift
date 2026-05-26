@@ -42,6 +42,22 @@ import CMultitouchSupport
     #expect(selection.word == "word's")
 }
 
+@Test func wordContextExtractorReportsAbsoluteWordRangeInSourceForDuplicateWord() throws {
+    // Same word twice in the same sentence. The extractor must report the
+    // word's range anchored at the cursor offset — not at the first
+    // occurrence — so downstream highlight code can target the right
+    // instance instead of always falling back to "find first match".
+    let text = "set the timer and set the alarm"
+    let secondSet = text.range(of: "set the alarm")!.lowerBound.samePosition(in: text.utf16)!.utf16Offset(in: text)
+
+    let selection = try #require(WordContextExtractor.selection(in: text, utf16Offset: secondSet))
+
+    #expect(selection.word == "set")
+    let source = try #require(selection.wordRangeInSource)
+    #expect(source.lowerBound == secondSet)
+    #expect(source.upperBound == secondSet + 3)
+}
+
 @Test func sseParserExtractsStreamingContentAndIgnoresDone() {
     let lines = [
         "data: {\"choices\":[{\"delta\":{\"content\":\"意群\"}}]}",
@@ -198,7 +214,7 @@ import CMultitouchSupport
     )
 }
 
-@Test func promptBuilderUsesConfiguredTemplateAndPayload() {
+@Test func promptBuilderUsesConfiguredTemplateAndPayload() throws {
     let selection = WordSelection(word: "twist", context: "It's an ironic twist.", wordRangeInContext: 15..<20)
     let config = TranslationConfig(
         endpoint: "https://api.example.com",
@@ -212,7 +228,371 @@ import CMultitouchSupport
 
     #expect(messages.first?.role == "system")
     #expect(messages.first?.content.contains("Explain twist in zh") == true)
-    #expect(messages.last?.content.contains("\"pointed_word_start\":15") == true)
+    // Payload carries {word, sentence, position, target_language} and
+    // MUST NOT carry any of the legacy pointed_clause / pointed_sentence
+    // / pointed_word_* fields. Duplicate-word disambiguation is now done
+    // via the 3-word `position` substring (consumed by both the LLM and
+    // the client-side range-anchor localisation in AXWordReader).
+    let userContent = try #require(messages.last?.content)
+    let userData = try #require(userContent.data(using: .utf8))
+    let payload = try #require(try JSONSerialization.jsonObject(with: userData) as? [String: Any])
+    #expect(payload["word"] as? String == "twist")
+    #expect(payload["sentence"] as? String != nil)
+    #expect(payload["position"] as? String == "an ironic twist")
+    #expect(payload["target_language"] as? String == "zh")
+    #expect(payload["pointed_clause"] == nil)
+    #expect(payload["pointed_sentence"] == nil)
+    #expect(payload["pointed_word_start"] == nil)
+    #expect(payload["pointed_word_end"] == nil)
+    #expect(payload["context"] == nil)
+}
+
+@Test func promptBuilderNarrowsSentenceToClickedSentenceAcrossEnglishBoundary() throws {
+    // Two sentences in one context window. The user clicks the SECOND
+    // occurrence of "prompt" (in the second sentence). The payload's
+    // `sentence` field must be only that second sentence — with the
+    // trailing period kept (right boundary included) and the leading
+    // period of the previous sentence excluded (left boundary excluded).
+    let context = "Copy the below prompt into Codex. The prompt instructs Codex to create folders."
+    let secondPrompt = context.utf16Offset(of: "prompt instructs")
+    let selection = WordSelection(
+        word: "prompt",
+        context: context,
+        wordRangeInContext: secondPrompt..<(secondPrompt + 6)
+    )
+    let config = TranslationConfig(promptTemplate: PromptBuilder.defaultPromptTemplate)
+
+    let messages = PromptBuilder.messages(selection: selection, config: config)
+    let userContent = try #require(messages.last?.content)
+    let userData = try #require(userContent.data(using: .utf8))
+    let payload = try #require(try JSONSerialization.jsonObject(with: userData) as? [String: Any])
+    let sentence = try #require(payload["sentence"] as? String)
+    let position = try #require(payload["position"] as? String)
+
+    #expect(sentence == "The prompt instructs Codex to create folders.")
+    // Sentence narrowing already pruned the first "prompt" — the narrowed
+    // sentence has only one occurrence, so the cloze pass is a no-op and
+    // no `___` placeholder is emitted.
+    #expect(!sentence.contains("___"))
+    // Position is computed from the FULL context (not the narrowed
+    // sentence). The anchor sits in the middle of the second sentence's
+    // tokens, so the 3-word window is "The prompt instructs".
+    #expect(position == "The prompt instructs")
+}
+
+@Test func promptBuilderNarrowsSentenceToClickedSentenceAcrossChineseBoundary() throws {
+    // Chinese full-stop "。" must be recognised as a sentence boundary
+    // too, otherwise CJK context windows still send the entire passage
+    // and the LLM keeps picking the first occurrence.
+    let context = "这个 prompt 写得不好。下面的 prompt 用来调用助手。"
+    let secondPrompt = context.utf16Offset(of: "prompt 用来调用助手")
+    let selection = WordSelection(
+        word: "prompt",
+        context: context,
+        wordRangeInContext: secondPrompt..<(secondPrompt + 6)
+    )
+    let config = TranslationConfig(promptTemplate: PromptBuilder.defaultPromptTemplate)
+
+    let messages = PromptBuilder.messages(selection: selection, config: config)
+    let userContent = try #require(messages.last?.content)
+    let userData = try #require(userContent.data(using: .utf8))
+    let payload = try #require(try JSONSerialization.jsonObject(with: userData) as? [String: Any])
+    let sentence = try #require(payload["sentence"] as? String)
+    let position = try #require(payload["position"] as? String)
+
+    #expect(sentence == "下面的 prompt 用来调用助手。")
+    // Sentence narrowing already pruned the first "prompt" — the cloze
+    // pass is a no-op for the surviving single occurrence.
+    #expect(!sentence.contains("___"))
+    // Tokens around the anchor: "下面的", "prompt", "用来调用助手" — middle
+    // case, so position is "下面的 prompt 用来调用助手" (verbatim slice with
+    // both inter-token spaces).
+    #expect(position == "下面的 prompt 用来调用助手")
+}
+
+@Test func promptBuilderUsesFullContextWhenSentenceHasNoBoundary() throws {
+    // No boundary punctuation anywhere → `sentence` must degrade to the
+    // entire context, NOT empty-string out.
+    let context = "abcdef hello world ghijkl"
+    let helloStart = context.utf16Offset(of: "hello")
+    let selection = WordSelection(
+        word: "hello",
+        context: context,
+        wordRangeInContext: helloStart..<(helloStart + 5)
+    )
+    let config = TranslationConfig(promptTemplate: PromptBuilder.defaultPromptTemplate)
+
+    let messages = PromptBuilder.messages(selection: selection, config: config)
+    let userContent = try #require(messages.last?.content)
+    let userData = try #require(userContent.data(using: .utf8))
+    let payload = try #require(try JSONSerialization.jsonObject(with: userData) as? [String: Any])
+    let sentence = try #require(payload["sentence"] as? String)
+
+    #expect(sentence == context)
+}
+
+@Test func promptBuilderKeepsCommasInsideSentenceWhenClickingDuplicateWord() throws {
+    // Same word twice WITHIN A SINGLE SENTENCE (comma-separated clauses).
+    // Comma is intentionally NOT a sentence boundary — the narrowed
+    // sentence must contain BOTH clauses. Duplicate-word disambiguation
+    // now combines the `position` field with a client-side cloze pass that
+    // replaces every NON-anchor occurrence of the pointed word with `___`,
+    // so the LLM sees a single literal occurrence and cannot pick wrong.
+    let context = "Set the timer, and set the alarm."
+    let secondSet = context.utf16Offset(of: "set the alarm")
+    let selection = WordSelection(
+        word: "set",
+        context: context,
+        wordRangeInContext: secondSet..<(secondSet + 3)
+    )
+    let config = TranslationConfig(promptTemplate: PromptBuilder.defaultPromptTemplate)
+
+    let messages = PromptBuilder.messages(selection: selection, config: config)
+    let userContent = try #require(messages.last?.content)
+    let userData = try #require(userContent.data(using: .utf8))
+    let payload = try #require(try JSONSerialization.jsonObject(with: userData) as? [String: Any])
+    let sentence = try #require(payload["sentence"] as? String)
+    let position = try #require(payload["position"] as? String)
+
+    // First "Set" (case-insensitive match) becomes `___`; the clicked
+    // second "set" stays intact so the LLM still has one literal anchor.
+    #expect(sentence == "___ the timer, and set the alarm.")
+    // Anchor sits on the SECOND "set". Its neighbours are "and" (left)
+    // and "the" (right), so the verbatim slice is "and set the".
+    #expect(position == "and set the")
+}
+
+// MARK: - Position derivation
+//
+// These tests pin the `PromptBuilder.position(for:)` behavior against the
+// design's three boundary cases: middle (one neighbour each side), head
+// (sentence-initial → two right neighbours), tail (sentence-final → two
+// left neighbours), plus verbatim preservation of interstitial commas /
+// markdown stars and the "fewer than 3 tokens → whole context" fallback.
+
+@Test func promptBuilderPositionPicksMiddleNeighboursForUserRepro() throws {
+    // The user's actual repro: a markdown bullet with three "plan" tokens
+    // and one "Plan" capitalisation. The user clicks the SECOND lowercase
+    // "plan" (in "keep plan status updates"). Position must be the verbatim
+    // 3-word window "keep plan status".
+    let context = "- Make sure it's clear the plan is *immutable*, keep plan status updates in a separate file, don't let the agent cheat by updating the plan"
+    let secondPlan = context.utf16Offset(of: "plan status")
+    let selection = WordSelection(
+        word: "plan",
+        context: context,
+        wordRangeInContext: secondPlan..<(secondPlan + 4)
+    )
+
+    #expect(PromptBuilder.position(for: selection) == "keep plan status")
+}
+
+@Test func promptBuilderPositionTakesTwoRightNeighboursAtSentenceHead() throws {
+    // Anchor on the very first token — there's no left neighbour, so the
+    // position window walks two tokens right.
+    let context = "Plan A is good."
+    let plan = context.utf16Offset(of: "Plan")
+    let selection = WordSelection(
+        word: "Plan",
+        context: context,
+        wordRangeInContext: plan..<(plan + 4)
+    )
+
+    #expect(PromptBuilder.position(for: selection) == "Plan A is")
+}
+
+@Test func promptBuilderPositionTakesTwoLeftNeighboursAtSentenceTail() throws {
+    // Anchor on the very last token in the user's bullet — no right
+    // neighbour. Take two tokens to the left of the anchor instead.
+    let context = "- Make sure it's clear the plan is *immutable*, keep plan status updates in a separate file, don't let the agent cheat by updating the plan"
+    let utf16 = Array(context.utf16)
+    // The last "plan" begins at utf16.count - 4 (length of "plan").
+    let lastPlanStart = utf16.count - 4
+    let selection = WordSelection(
+        word: "plan",
+        context: context,
+        wordRangeInContext: lastPlanStart..<utf16.count
+    )
+
+    #expect(PromptBuilder.position(for: selection) == "updating the plan")
+}
+
+@Test func promptBuilderPositionKeepsInterstitialCommasVerbatim() throws {
+    // Interstitial commas / whitespace between the chosen tokens must be
+    // preserved EXACTLY — the position string is a verbatim substring of
+    // the context. Here both gaps carry a comma + space, so the slice is
+    // "foo, bar, baz".
+    let context = "foo, bar, baz"
+    let bar = context.utf16Offset(of: "bar")
+    let selection = WordSelection(
+        word: "bar",
+        context: context,
+        wordRangeInContext: bar..<(bar + 3)
+    )
+
+    #expect(PromptBuilder.position(for: selection) == "foo, bar, baz")
+}
+
+@Test func promptBuilderPositionFallsBackToWholeContextWhenFewerThanThreeTokens() throws {
+    // Only two tokens in the context — the design says return the whole
+    // context unchanged.
+    let context = "Hello there"
+    let hello = context.utf16Offset(of: "Hello")
+    let selection = WordSelection(
+        word: "Hello",
+        context: context,
+        wordRangeInContext: hello..<(hello + 5)
+    )
+
+    #expect(PromptBuilder.position(for: selection) == "Hello there")
+}
+
+@Test func promptBuilderPositionDisambiguatesSetTheAlarm() throws {
+    // The known-limitation case for the previous sentence-narrowing
+    // approach: "Set the timer and set the alarm." with the user pointing
+    // at the SECOND "set". Position is "and set the" — the disambiguator
+    // the LLM (and our range-anchor localisation) now gets.
+    let context = "Set the timer and set the alarm."
+    let secondSet = context.utf16Offset(of: "set the alarm")
+    let selection = WordSelection(
+        word: "set",
+        context: context,
+        wordRangeInContext: secondSet..<(secondSet + 3)
+    )
+
+    #expect(PromptBuilder.position(for: selection) == "and set the")
+}
+
+@Test func promptBuilderPositionPreservesMarkdownStars() throws {
+    // Markdown asterisks live between tokens. They count as interstitial
+    // and stay in the verbatim slice. Here the anchor is "immutable",
+    // surrounded by "*immutable*" — the two neighbours are "is" (left)
+    // and "keep" (right, jumping over ", "), so position is
+    // "is *immutable*, keep".
+    let context = "the plan is *immutable*, keep plan status"
+    let immutable = context.utf16Offset(of: "immutable")
+    let selection = WordSelection(
+        word: "immutable",
+        context: context,
+        wordRangeInContext: immutable..<(immutable + 9)
+    )
+
+    #expect(PromptBuilder.position(for: selection) == "is *immutable*, keep")
+}
+
+// MARK: - Cloze pass
+//
+// The cloze pass replaces every non-anchor occurrence of the pointed word
+// with `___` so the LLM only ever sees a single literal instance of the
+// pointed word. This is the validated fix for the duplicate-word
+// disambiguation bug. These tests pin the contract directly via the
+// internal helper plus an end-to-end check through `messages(selection:config:)`.
+
+@Test func clozeReplacesSecondOccurrenceLeavingAnchorIntact() {
+    // Anchor sits on the SECOND "plan"; the first occurrence becomes `___`.
+    let sentence = "the plan is good, the plan is bad"
+    let anchor = sentence.utf16Offset(of: "plan is bad")
+    let result = PromptBuilder.clozeSentence(
+        originalSentence: sentence,
+        anchorRangeInSentence: anchor..<(anchor + 4),
+        word: "plan"
+    )
+    #expect(result == "the ___ is good, the plan is bad")
+}
+
+@Test func clozeIsCaseInsensitive() {
+    // "Plan A" at the sentence head is uppercase; the anchor is the
+    // lowercase "Plan" later. Case-folded matching means the uppercase
+    // form still becomes `___`.
+    let sentence = "Plan A is good. Plan B is bad."
+    let secondPlan = sentence.utf16Offset(of: "Plan B")
+    let result = PromptBuilder.clozeSentence(
+        originalSentence: sentence,
+        anchorRangeInSentence: secondPlan..<(secondPlan + 4),
+        word: "plan"
+    )
+    #expect(result == "___ A is good. Plan B is bad.")
+}
+
+@Test func clozeHandlesCJK() {
+    // CJK has no inter-word whitespace — make sure UTF-16 offset math still
+    // lands on the right occurrence. "计划" appears twice; clicking the
+    // second one leaves it intact and turns the first into `___`.
+    let sentence = "他有一个计划，但这个计划不好"
+    let secondPlan = sentence.utf16Offset(of: "计划不好")
+    let result = PromptBuilder.clozeSentence(
+        originalSentence: sentence,
+        anchorRangeInSentence: secondPlan..<(secondPlan + 2),
+        word: "计划"
+    )
+    #expect(result == "他有一个___，但这个计划不好")
+}
+
+@Test func clozeHandlesThreePlusOccurrencesInUserRepro() {
+    // The user's actual bullet has three "plan" tokens plus one "Plan"
+    // capitalisation. Clicking the SECOND lowercase "plan" must leave that
+    // single occurrence intact and turn every other one (including the
+    // capitalised match) into `___`.
+    let sentence = "- Make sure it's clear the plan is *immutable*, keep plan status updates in a separate file, don't let the agent cheat by updating the plan"
+    let anchor = sentence.utf16Offset(of: "plan status")
+    let result = PromptBuilder.clozeSentence(
+        originalSentence: sentence,
+        anchorRangeInSentence: anchor..<(anchor + 4),
+        word: "plan"
+    )
+    // Exactly one literal "plan" survives — the clicked one. Every other
+    // occurrence (regardless of case) becomes `___`.
+    #expect(result == "- Make sure it's clear the ___ is *immutable*, keep plan status updates in a separate file, don't let the agent cheat by updating the ___")
+    // Sanity: count the surviving literal occurrences of "plan" — exactly
+    // one match (case-sensitive lowercase, since the anchor stayed
+    // lowercase). The capital "Plan" / second "Plan" reference here was
+    // imaginary; this sentence has three lowercase "plan" tokens, the
+    // user's actual repro. The cloze leaves exactly the anchor alone.
+    let surviving = result.components(separatedBy: "plan").count - 1
+    #expect(surviving == 1)
+}
+
+@Test func clozeWithSingleOccurrenceIsNoOp() {
+    // Sanity check: when the pointed word appears exactly once, the cloze
+    // pass must return the sentence unchanged.
+    let sentence = "It's an ironic twist that we might all end up as NPCs."
+    let anchor = sentence.utf16Offset(of: "twist")
+    let result = PromptBuilder.clozeSentence(
+        originalSentence: sentence,
+        anchorRangeInSentence: anchor..<(anchor + 5),
+        word: "twist"
+    )
+    #expect(result == sentence)
+    #expect(!result.contains("___"))
+}
+
+@Test func clozeAppliedThroughMessagesForUserRepro() throws {
+    // End-to-end check through `messages(selection:config:)`. The user's
+    // actual bullet, clicking the SECOND lowercase "plan". The payload's
+    // `sentence` field must be the cloze version.
+    let context = "- Make sure it's clear the plan is *immutable*, keep plan status updates in a separate file, don't let the agent cheat by updating the plan"
+    let secondPlan = context.utf16Offset(of: "plan status")
+    let selection = WordSelection(
+        word: "plan",
+        context: context,
+        wordRangeInContext: secondPlan..<(secondPlan + 4)
+    )
+    let config = TranslationConfig(promptTemplate: PromptBuilder.defaultPromptTemplate)
+
+    let messages = PromptBuilder.messages(selection: selection, config: config)
+    let userContent = try #require(messages.last?.content)
+    let userData = try #require(userContent.data(using: .utf8))
+    let payload = try #require(try JSONSerialization.jsonObject(with: userData) as? [String: Any])
+    let sentence = try #require(payload["sentence"] as? String)
+
+    // Cloze drops every non-anchor "plan" to `___`; the clicked one
+    // remains as the single literal anchor for the LLM. The bullet has no
+    // sentence-boundary punctuation, so `sentence` covers the whole
+    // context with the cloze applied.
+    #expect(sentence == "- Make sure it's clear the ___ is *immutable*, keep plan status updates in a separate file, don't let the agent cheat by updating the ___")
+    // `position` is unaffected by the cloze (still computed from the
+    // original `context`).
+    let position = try #require(payload["position"] as? String)
+    #expect(position == "keep plan status")
 }
 
 @Test func openRouterStreamingSmokeWhenConfigured() async throws {
@@ -252,7 +632,21 @@ import CMultitouchSupport
     let prompt = PromptBuilder.defaultPromptTemplate
 
     #expect(prompt.contains("ONLY a JSON object"))
-    #expect(prompt.contains("source_chunk MUST be an exact substring"))
+    // Sentence-based contract aligned with the Android sibling: the
+    // payload now carries only {word, sentence, target_language} and
+    // source_chunk must be a substring of `sentence`. Any reintroduction
+    // of `pointed_clause` / « » markers would mean we regressed the
+    // simplification.
+    #expect(prompt.contains("source_chunk MUST be an exact substring of the sentence"))
+    #expect(prompt.contains("source_chunk MUST contain the pointed word"))
+    // The cloze-placeholder rule must be present so the LLM never emits
+    // `___` as part of source_chunk.
+    #expect(prompt.contains("source_chunk MUST NOT contain `___`"))
+    #expect(prompt.contains("Three consecutive underscores"))
+    #expect(prompt.contains("placeholder"))
+    #expect(!prompt.contains("pointed_clause"))
+    #expect(!prompt.contains("«"))
+    #expect(!prompt.contains("»"))
     #expect(prompt.contains("target_chunk MUST translate ONLY source_chunk"))
     #expect(prompt.contains("word_pos MUST be a short English POS abbreviation"))
     #expect(prompt.contains("word_brief MUST be a 5-15 character"))

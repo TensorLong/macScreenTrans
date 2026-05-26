@@ -4,11 +4,26 @@ public struct WordSelection: Equatable, Sendable {
     public let word: String
     public let context: String
     public let wordRangeInContext: Range<Int>
+    /// UTF-16 range of `word` inside the original `text` passed to
+    /// `WordContextExtractor.selection`. Optional because synthetic
+    /// WordSelection values (LLM-fallback, settings smoke-test) don't have
+    /// a meaningful source string. When present, downstream code uses it
+    /// to anchor "find word in element text" lookups to the clicked
+    /// occurrence — without it, the lookups would silently pick the first
+    /// occurrence and mis-place the yellow/green highlight whenever the
+    /// same word appears twice in the surrounding text.
+    public let wordRangeInSource: Range<Int>?
 
-    public init(word: String, context: String, wordRangeInContext: Range<Int>) {
+    public init(
+        word: String,
+        context: String,
+        wordRangeInContext: Range<Int>,
+        wordRangeInSource: Range<Int>? = nil
+    ) {
         self.word = word
         self.context = context
         self.wordRangeInContext = wordRangeInContext
+        self.wordRangeInSource = wordRangeInSource
     }
 }
 
@@ -49,7 +64,8 @@ public enum WordContextExtractor {
         return WordSelection(
             word: word,
             context: context,
-            wordRangeInContext: (wordStart - contextStartOffset)..<(wordEnd - contextStartOffset)
+            wordRangeInContext: (wordStart - contextStartOffset)..<(wordEnd - contextStartOffset),
+            wordRangeInSource: wordStart..<wordEnd
         )
     }
 
