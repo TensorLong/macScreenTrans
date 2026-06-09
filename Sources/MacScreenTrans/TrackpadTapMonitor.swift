@@ -21,8 +21,12 @@ final class TrackpadTapMonitor: @unchecked Sendable {
     init() {
         detector = ThreeFingerTapDetector {}
         detector = ThreeFingerTapDetector { [weak self] in
+            // Hoist `onTap` out of `self` before hopping to the main queue so
+            // the escaping closure sends a captured function value, not the
+            // monitor itself, across the concurrency boundary (Swift 6).
+            guard let onTap = self?.onTap else { return }
             DispatchQueue.main.async {
-                self?.onTap?()
+                onTap()
             }
         }
     }

@@ -74,7 +74,7 @@ public enum SenseGroupResponseRenderer {
     }
 
     /// Render the popup text with an explicit word override. Use this when the
-    /// caller knows the actual target word (from AXWordReader.selection.word)
+    /// caller knows the actual target word (from the word reader's selection.word)
     /// and wants to display it independently of what the LLM put in source_chunk.
     public static func displayText(for rawText: String, overrideWord: String?) -> String {
         guard let response = response(for: rawText) else {

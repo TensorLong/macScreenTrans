@@ -43,7 +43,7 @@ final class PhraseHighlightOverlayController {
     }
 
     /// Show the green phrase highlight covering the screen region of each
-    /// segment. `segments` is what `AXWordReader.Result.phraseSegments(for:)`
+    /// segment. `segments` is what `OCRWordReader.Result.phraseSegments(for:)`
     /// returned — one entry per visual line, with each entry's rect in
     /// AppKit screen coordinates and its `text` being the slice of the
     /// phrase that appears on that line.
@@ -51,7 +51,7 @@ final class PhraseHighlightOverlayController {
     /// `font` is the best-available font for redrawing the phrase text. Pass
     /// nil to let the view infer a font from segment rect height, same
     /// heuristic the yellow overlay uses.
-    func show(segments: [AXWordReader.PhraseSegment], font: NSFont?) {
+    func show(segments: [PhraseSegment], font: NSFont?) {
         guard !segments.isEmpty else {
             hide()
             return

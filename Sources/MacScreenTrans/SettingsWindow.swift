@@ -35,7 +35,7 @@ private struct SettingsView: View {
     let onSelfCheck: () -> String
     let onTranslateUnderCursor: () -> Void
     @State private var selfCheckResult = ""
-    @State private var permissionGranted = PermissionHelper.accessibilityTrusted
+    @State private var permissionGranted = PermissionHelper.screenRecordingGranted
     @State private var connectionResult = ""
     @State private var isTestingConnection = false
     @State private var showSelfCheckResult = false
@@ -78,7 +78,7 @@ private struct SettingsView: View {
                 Text("MacScreenTrans 设置")
                     .font(.title2)
                     .fontWeight(.semibold)
-                Text("配置光标取词翻译、辅助功能权限和模型连接。API Key 不会在状态或结果中显示。")
+                Text("配置光标取词翻译、屏幕录制权限和模型连接。API Key 不会在状态或结果中显示。")
                     .foregroundStyle(.secondary)
             }
             Spacer()
@@ -93,9 +93,9 @@ private struct SettingsView: View {
             VStack(alignment: .leading, spacing: 14) {
                 HStack(spacing: 12) {
                     StatusTile(
-                        title: "辅助功能",
+                        title: "屏幕录制",
                         value: permissionGranted ? "已授权" : "需要授权",
-                        detail: permissionGranted ? "可以读取光标下文本" : "请允许 MacScreenTrans 访问辅助功能",
+                        detail: permissionGranted ? "可以截取屏幕识别文字" : "请允许 MacScreenTrans 录制屏幕",
                         state: permissionGranted ? .good : .warning
                     )
                     StatusTile(
@@ -173,9 +173,9 @@ private struct SettingsView: View {
                     .frame(maxWidth: .infinity)
 
                     Button {
-                        PermissionHelper.openAccessibilitySettings()
+                        PermissionHelper.openScreenRecordingSettings()
                     } label: {
-                        Label("打开辅助功能设置", systemImage: "gearshape")
+                        Label("打开屏幕录制设置", systemImage: "gearshape")
                     }
                     .frame(maxWidth: .infinity)
 
@@ -276,7 +276,7 @@ private struct SettingsView: View {
     }
 
     private func refreshStatuses() {
-        permissionGranted = PermissionHelper.accessibilityTrusted
+        permissionGranted = PermissionHelper.screenRecordingGranted
         selfCheckResult = onSelfCheck()
     }
 
@@ -289,7 +289,7 @@ private struct SettingsView: View {
         refreshStatuses()
         connectionResult = permissionGranted
             ? "已请求翻译光标下文本。请查看光标附近的弹窗。"
-            : "需要辅助功能权限。点击“打开辅助功能设置”授权 MacScreenTrans 后重启应用。"
+            : "需要屏幕录制权限。点击“打开屏幕录制设置”授权 MacScreenTrans 后重启应用。"
         onTranslateUnderCursor()
     }
 

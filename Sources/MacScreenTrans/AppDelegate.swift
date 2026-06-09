@@ -71,8 +71,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         settingsWindow?.show()
-        if !PermissionHelper.accessibilityTrusted || !AppConfiguration.hasMinimumLLMConfig {
-            PermissionHelper.promptForAccessibility()
+        if !PermissionHelper.screenRecordingGranted || !AppConfiguration.hasMinimumLLMConfig {
+            PermissionHelper.requestScreenRecording()
         }
     }
 
@@ -192,61 +192,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let point = NSEvent.mouseLocation
         dlog("=== handleThreeFingerTap entered at point=\(point) ===")
 
-        guard PermissionHelper.accessibilityTrusted else {
-            dlog("early-return: accessibility-not-trusted")
-            PermissionHelper.promptForAccessibility()
+        guard PermissionHelper.screenRecordingGranted else {
+            dlog("early-return: screen-recording-not-granted")
+            PermissionHelper.requestScreenRecording()
             popup.show(
                 at: point,
-                text: "需要辅助功能权限。\n请打开设置页，点击“打开辅助功能设置”，允许 MacScreenTrans 后重启应用。"
+                text: "需要屏幕录制权限。\n请打开设置页，点击“打开屏幕录制设置”，允许 MacScreenTrans 后重启应用。"
             )
             return
         }
 
-        // Issue 5 — role gate. `AXWordReader.resolve` will gladly return a
-        // stale word from the nearest text element when the cursor sits on
-        // a button / image / empty space, which kicks off the (expensive)
-        // LLM round-trip for a word the user wasn't pointing at. Short-
-        // circuit on non-text roles BEFORE we call resolve. v0.2.1 keeps a
-        // compact debug popup (no LLM call) per explicit user instruction;
-        // v0.3 may swap this for a true visual no-op.
-        let probe = AXTextRoleProbe.probe(at: point)
-        switch probe {
-        case .text:
-            break  // continue to resolve
-        case .nonText(let role):
-            dlog("early-return: role-gate-nonText role=\(role)")
+        // No AX role gate any more: the OCR reader IS the text detector. When
+        // the tap doesn't land on a recognized word, `resolve` returns nil
+        // with a populated diagnostic, and we show the same compact popup
+        // (no LLM round-trip) the role gate used to.
+        guard let result = OCRWordReader.resolve(at: point) else {
+            dlog("early-return: resolve-nil ocr_diagnostic=\(OCRWordReader.lastDiagnostic.debugDescription)")
             popup.show(
                 at: point,
                 text: """
-                当前位置不是文本（role: \(role)）。
-                — 角色门控（v\(AppConfiguration.appVersion) debug）—
-                \(AXTextRoleProbe.lastTrace)
-                """
-            )
-            return
-        case .failed(let reason):
-            dlog("early-return: role-probe-failed reason=\(reason.debugDescription)")
-            popup.show(
-                at: point,
-                text: """
-                AX 角色探测失败。
-                — 角色门控（v\(AppConfiguration.appVersion) debug）—
-                \(reason)
-                """
-            )
-            return
-        }
+                当前位置未识别到文字。
+                请把鼠标放在屏幕上清晰可见的文字上再试。
 
-        guard let result = AXWordReader.resolve(at: point) else {
-            dlog("early-return: resolve-nil ax_diagnostic=\(AXWordReader.lastDiagnostic.debugDescription)")
-            popup.show(
-                at: point,
-                text: """
-                当前位置不支持取词。
-                请把鼠标放在可选择的正文或输入框文字上再试。
-
-                — AX 诊断（v\(AppConfiguration.appVersion) debug）—
-                \(AXWordReader.lastDiagnostic)
+                — OCR 诊断（v\(AppConfiguration.appVersion) debug）—
+                \(OCRWordReader.lastDiagnostic)
                 """
             )
             return
@@ -260,7 +229,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         dlog("context=\(selection.context.debugDescription)")
         dlog("wordRect=\(String(describing: result.wordRect))")
         dlog("clickedWordRangeInLookupText=\(String(describing: result.clickedWordRangeInLookupText))")
-        dlog("ax_diagnostic=\(AXWordReader.lastDiagnostic.debugDescription)")
+        dlog("ocr_diagnostic=\(OCRWordReader.lastDiagnostic.debugDescription)")
         let _ctxUTF16 = selection.context.utf16
         let _s = selection.wordRangeInContext.lowerBound
         let _e = selection.wordRangeInContext.upperBound
@@ -300,7 +269,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let lookupBox = PhraseLookupBox(result: result)
         // Compute the 3-word verbatim position string once per resolve.
         // It accompanies the LLM payload AND drives the new range-anchor
-        // localisation in AXWordReader.phraseSegments — the cursor anchor
+        // localisation in OCRWordReader.phraseSegments — the cursor anchor
         // expands from a single-word range to a 3-word neighbourhood, so
         // any reasonable source_chunk that overlaps the neighbourhood
         // passes cover. Wraps duplicate-word sentences where the LLM picks
@@ -330,7 +299,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     // Reveal the green phrase overlay as soon as the LLM gives us
                     // a usable source phrase, regardless of whether we'll later
                     // fall through to the translation-only fallback. Per-line
-                    // segments come from AXWordReader.phraseSegments. Derive
+                    // segments come from OCRWordReader.phraseSegments. Derive
                     // the phrase font from the resolved word rect (or fall
                     // back to nil → the overlay infers from segment height)
                     // so the redraw doesn't pick up a stale ~70pt font when
@@ -343,7 +312,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                             for (i, seg) in segs.enumerated() {
                                 dlog("  seg[\(i)] rangeInElementText=\(seg.rangeInElementText) rect=\(seg.rect) text=\(seg.text.debugDescription)")
                             }
-                            dlog("ax_diagnostic_after_segments=\(AXWordReader.lastDiagnostic.debugDescription)")
+                            dlog("ocr_diagnostic_after_segments=\(OCRWordReader.lastDiagnostic.debugDescription)")
                             if !segs.isEmpty {
                                 let phraseFont: NSFont?
                                 if let wordRect = lookupBox.result.wordRect {
@@ -440,7 +409,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// "set" the user actually pointed at, instead of always the first
     /// occurrence the old `range(of: word)` shortcut returned.
     private static func deriveWordRectFromSegments(
-        segments: [AXWordReader.PhraseSegment],
+        segments: [PhraseSegment],
         clickedWordRange: Range<Int>?
     ) -> NSRect? {
         guard let anchor = clickedWordRange, anchor.lowerBound < anchor.upperBound else {
@@ -505,7 +474,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             : "未运行\(trackpadMonitor.lastError.map { ": \($0)" } ?? "")"
 
         return """
-        辅助功能权限：\(PermissionHelper.accessibilityTrusted ? "已授权" : "未授权")
+        屏幕录制权限：\(PermissionHelper.screenRecordingGranted ? "已授权" : "未授权")
         三指轻点监听：\(trackpadStatus)
         Endpoint：\(endpointOK ? "正常" : "无效")
         API Key：\(apiKeyOK ? "已配置" : "缺失")
@@ -522,12 +491,10 @@ extension AppDelegate: NSMenuDelegate {
     }
 }
 
-/// Carries an `AXWordReader.Result` across the Sendable boundary into the
-/// streaming Task. The wrapped Result holds an AXUIElement; CoreFoundation
-/// retain/release and the AX accessor APIs we touch are documented as safe
-/// from background queues, so the unchecked conformance is sound. Wrapping
-/// keeps the unsafety contained — Swift 6 strict-concurrency only sees a
-/// single explicit override here.
-private struct PhraseLookupBox: @unchecked Sendable {
-    let result: AXWordReader.Result
+/// Carries an `OCRWordReader.Result` into the streaming Task. The OCR result
+/// is a pure value type (text, ranges, screen rects) with no Accessibility
+/// element handles, so it is genuinely `Sendable` — no unchecked override
+/// needed.
+private struct PhraseLookupBox: Sendable {
+    let result: OCRWordReader.Result
 }
