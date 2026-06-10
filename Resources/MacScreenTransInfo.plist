@@ -21,7 +21,5 @@
 	<string>17</string>
   <key>LSMinimumSystemVersion</key>
   <string>13.0</string>
-  <key>NSAppleEventsUsageDescription</key>
-  <string>MacScreenTrans uses Accessibility to read the word under the cursor after a three-finger tap.</string>
 </dict>
 </plist>

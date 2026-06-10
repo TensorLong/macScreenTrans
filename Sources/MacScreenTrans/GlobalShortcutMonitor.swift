@@ -1,56 +1,85 @@
 import AppKit
+import Carbon.HIToolbox
 
-/// Listens for a global hotkey (Cmd+Option+T) and invokes the registered
-/// callback whenever it fires. v0.2.2 adds this as an escape hatch so the
-/// user can still trigger translation while the three-finger trackpad
-/// gesture is silently rejecting touches (see Issue 5 follow-up). We use
-/// `NSEvent.addGlobalMonitorForEvents` (cursor in another app) plus
-/// `addLocalMonitorForEvents` (MacScreenTrans focused) because the global
-/// monitor doesn't observe key events delivered to the current process.
+/// Registers a global hotkey (Cmd+Option+T) and invokes the registered
+/// callback whenever it fires — the escape hatch for triggering translation
+/// when the three-finger trackpad gesture isn't available.
 ///
-/// Both monitors require the same Accessibility permission we already
-/// request — no new TCC prompt. The local monitor returns `nil` so the
-/// keystroke doesn't propagate as a text-input "t" inside any text
-/// field MacScreenTrans owns.
+/// Implemented with Carbon's `RegisterEventHotKey`, which needs NO TCC
+/// permission and fires regardless of which app is focused. The previous
+/// `NSEvent.addGlobalMonitorForEvents` implementation silently required
+/// Accessibility permission — which this app stopped requesting when the
+/// word-capture backend moved from AX to Screen Recording — so the hotkey
+/// never fired unless MacScreenTrans itself was frontmost.
 @MainActor
 final class GlobalShortcutMonitor {
-    private var globalMonitor: Any?
-    private var localMonitor: Any?
+    private var hotKeyRef: EventHotKeyRef?
+    private var eventHandlerRef: EventHandlerRef?
     private var onTrigger: (() -> Void)?
+
+    private static let signature: OSType = 0x4D53_5454 // 'MSTT'
 
     func start(onTrigger: @escaping () -> Void) {
         stop()
         self.onTrigger = onTrigger
 
-        let mask: NSEvent.EventTypeMask = .keyDown
-
-        globalMonitor = NSEvent.addGlobalMonitorForEvents(matching: mask) { [weak self] event in
-            guard let self else { return }
-            if Self.matchesShortcut(event) {
+        var eventType = EventTypeSpec(
+            eventClass: OSType(kEventClassKeyboard),
+            eventKind: UInt32(kEventHotKeyPressed)
+        )
+        // The handler fires on the main thread (application event target).
+        // The context pointer carries `self` unretained; `stop()` removes
+        // the handler before the monitor could ever go away.
+        let context = Unmanaged.passUnretained(self).toOpaque()
+        InstallEventHandler(
+            GetApplicationEventTarget(),
+            { _, event, context -> OSStatus in
+                guard let event, let context else { return noErr }
+                var hotKeyID = EventHotKeyID()
+                GetEventParameter(
+                    event,
+                    EventParamName(kEventParamDirectObject),
+                    EventParamType(typeEventHotKeyID),
+                    nil,
+                    MemoryLayout<EventHotKeyID>.size,
+                    nil,
+                    &hotKeyID
+                )
+                guard hotKeyID.signature == GlobalShortcutMonitor.signature else { return noErr }
+                let monitor = Unmanaged<GlobalShortcutMonitor>.fromOpaque(context).takeUnretainedValue()
+                // Carbon dispatches application-target handlers on the main
+                // thread; assumeIsolated converts that runtime guarantee for
+                // the compiler.
                 MainActor.assumeIsolated {
-                    self.fire()
+                    monitor.fire()
                 }
-            }
-        }
+                return noErr
+            },
+            1,
+            &eventType,
+            context,
+            &eventHandlerRef
+        )
 
-        localMonitor = NSEvent.addLocalMonitorForEvents(matching: mask) { [weak self] event in
-            guard let self else { return event }
-            if Self.matchesShortcut(event) {
-                self.fire()
-                return nil
-            }
-            return event
-        }
+        let hotKeyID = EventHotKeyID(signature: Self.signature, id: 1)
+        RegisterEventHotKey(
+            UInt32(kVK_ANSI_T),
+            UInt32(cmdKey | optionKey),
+            hotKeyID,
+            GetApplicationEventTarget(),
+            0,
+            &hotKeyRef
+        )
     }
 
     func stop() {
-        if let monitor = globalMonitor {
-            NSEvent.removeMonitor(monitor)
-            globalMonitor = nil
+        if let hotKeyRef {
+            UnregisterEventHotKey(hotKeyRef)
+            self.hotKeyRef = nil
         }
-        if let monitor = localMonitor {
-            NSEvent.removeMonitor(monitor)
-            localMonitor = nil
+        if let eventHandlerRef {
+            RemoveEventHandler(eventHandlerRef)
+            self.eventHandlerRef = nil
         }
         onTrigger = nil
     }
@@ -62,14 +91,5 @@ final class GlobalShortcutMonitor {
 
     private func fire() {
         onTrigger?()
-    }
-
-    /// Matches Cmd+Option+T exactly. Other modifier combinations (e.g.
-    /// Cmd+Shift+Option+T) are intentionally excluded so we don't steal
-    /// shortcuts the user wired up in another tool.
-    private static func matchesShortcut(_ event: NSEvent) -> Bool {
-        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
-        guard flags == [.command, .option] else { return false }
-        return event.charactersIgnoringModifiers?.lowercased() == "t"
     }
 }
