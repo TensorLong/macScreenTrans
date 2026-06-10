@@ -32,6 +32,12 @@ final class FloatingTranslationWindowController {
     private var dismissArmedAt = Date.distantPast
     private var onCloseHandler: (() -> Void)?
     private var onScrollAwayHandler: (() -> Void)?
+    /// The sense-group translation body shown in the scrollable target area.
+    private var targetBodyText = ""
+    /// Second-stage content from the repeat-tap gesture: the full-sentence
+    /// translation rendered below `targetBodyText` behind a divider. Nil
+    /// hides the section; cleared by every show().
+    private var sentenceSectionText: String?
     nonisolated(unsafe) private var localDismissMonitor: Any?
     nonisolated(unsafe) private var globalKeyMonitor: Any?
     nonisolated(unsafe) private var globalMouseMonitor: Any?
@@ -215,6 +221,7 @@ final class FloatingTranslationWindowController {
         // Non-anchored: no edge to pin. Clear state so update() doesn't try
         // to reflow against stale geometry.
         anchorState = nil
+        sentenceSectionText = nil
         update(text)
         bubbleBackground.tailConfig = nil
         let size = NSSize(width: Self.popupWidth, height: Self.panelHeight)
@@ -305,6 +312,7 @@ final class FloatingTranslationWindowController {
         )
 
         // update() runs reflowAnchoredFrame() which calls setFrame.
+        sentenceSectionText = nil
         update(text)
         panel.orderFrontRegardless()
         dismissArmedAt = Date().addingTimeInterval(0.25)
@@ -319,12 +327,43 @@ final class FloatingTranslationWindowController {
         briefLabel.stringValue = parsed.wordBrief
         briefLabel.isHidden = parsed.wordBrief.isEmpty
         sourceStack.isHidden = parsed.word.isEmpty
-        targetTextView.string = parsed.target
-        targetTextView.scrollToEndOfDocument(nil)
+        targetBodyText = parsed.target
+        renderTargetArea()
 
         if let state = anchorState {
             reflowAnchoredFrame(state: state)
         }
+    }
+
+    /// Show/refresh the full-sentence translation below the sense-group
+    /// result. Streaming-friendly: call repeatedly with the growing text.
+    func updateSentenceSection(_ text: String) {
+        sentenceSectionText = text
+        renderTargetArea()
+    }
+
+    /// Compose the scrollable target area: the sense-group translation body
+    /// plus, when the repeat-tap gesture asked for it, a labeled divider and
+    /// the full-sentence translation. Everything lives in the one text view,
+    /// so the locked panel height holds and overflow just scrolls.
+    private func renderTargetArea() {
+        let bodyAttributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 15),
+            .foregroundColor: NSColor.labelColor,
+        ]
+        let composed = NSMutableAttributedString(string: targetBodyText, attributes: bodyAttributes)
+        if let sentence = sentenceSectionText {
+            composed.append(NSAttributedString(
+                string: "\n\n────────  整句翻译  ────────\n",
+                attributes: [
+                    .font: NSFont.systemFont(ofSize: 11),
+                    .foregroundColor: NSColor.tertiaryLabelColor,
+                ]
+            ))
+            composed.append(NSAttributedString(string: sentence, attributes: bodyAttributes))
+        }
+        targetTextView.textStorage?.setAttributedString(composed)
+        targetTextView.scrollToEndOfDocument(nil)
     }
 
     /// Recompute the anchored panel's frame using the frozen `state`. The
@@ -353,10 +392,6 @@ final class FloatingTranslationWindowController {
         if !panel.frame.equalTo(newFrame) {
             panel.setFrame(newFrame, display: true)
         }
-    }
-
-    func append(_ delta: String) {
-        update(targetTextView.string + delta)
     }
 
     func close() {

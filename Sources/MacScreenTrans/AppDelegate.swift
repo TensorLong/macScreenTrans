@@ -27,6 +27,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// phrase at the old coordinates when the LLM answers). The popup itself
     /// survives — the user may be scrolling elsewhere to cross-reference.
     private var scrolledSinceTap = false
+    /// Second-stage gesture state: a repeat three-finger tap on the SAME
+    /// spot while the popup is up appends the full-sentence translation
+    /// below the sense-group result instead of starting a new lookup.
+    /// Captured when a resolve succeeds; cleared by every new tap, by
+    /// popup close, and ignored after a scroll (the tapped spot no longer
+    /// shows the same text).
+    private struct SentenceStage {
+        let sentence: String
+        let tapPoint: CGPoint
+        let wordRect: NSRect?
+        var requested = false
+    }
+    private var sentenceStage: SentenceStage?
+    private var sentenceTask: Task<Void, Never>?
     private lazy var popup: FloatingTranslationWindowController = {
         let controller = FloatingTranslationWindowController()
         controller.setOnClose { [weak self] in
@@ -37,6 +51,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.tapGeneration += 1
             self.streamingTask?.cancel()
             self.streamingTask = nil
+            self.sentenceTask?.cancel()
+            self.sentenceTask = nil
+            self.sentenceStage = nil
             self.highlightOverlay.hide()
             self.phraseOverlay.hide()
         }
@@ -92,6 +109,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         streamingTask?.cancel()
+        sentenceTask?.cancel()
         trackpadMonitor.stop()
         shortcutMonitor.stop()
     }
@@ -212,11 +230,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // re-read the cursor later and OCR wherever it drifted to.
         guard !resolveInFlight else { return }
 
+        // Second stage: same gesture, same spot, popup still up → translate
+        // the whole sentence into the existing popup instead of re-looking
+        // up the word. Skipped after a scroll (the spot shows other text
+        // now) so the tap falls through to a fresh lookup.
+        if let stage = sentenceStage,
+           popup.isPanelVisible,
+           !scrolledSinceTap,
+           Self.isRepeatTap(at: NSEvent.mouseLocation, stage: stage) {
+            startSentenceTranslation()
+            return
+        }
+
         tapGeneration += 1
         let generation = tapGeneration
         scrolledSinceTap = false
         streamingTask?.cancel()
         streamingTask = nil
+        sentenceTask?.cancel()
+        sentenceTask = nil
+        sentenceStage = nil
         highlightOverlay.hide()
         phraseOverlay.hide()
         let point = NSEvent.mouseLocation
@@ -256,12 +289,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 )
                 return
             }
-            self.startTranslation(for: result, generation: generation)
+            self.startTranslation(for: result, generation: generation, tapPoint: point)
         }
     }
 
-    private func startTranslation(for result: OCRWordReader.Result, generation: Int) {
+    private func startTranslation(for result: OCRWordReader.Result, generation: Int, tapPoint: CGPoint) {
         let selection = result.selection
+
+        // Arm the second-stage gesture: a repeat tap on this same spot
+        // appends the full-sentence translation to the popup.
+        sentenceStage = SentenceStage(
+            sentence: PromptBuilder.sentence(for: selection),
+            tapPoint: tapPoint,
+            wordRect: result.wordRect
+        )
 
         // Re-anchor the popup to the recognized word's screen rect when OCR
         // gives us bounds. Otherwise it stays at the cursor — this still
@@ -378,6 +419,64 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             } catch {
                 guard stillCurrent() else { return }
                 self.popup.update(Self.friendlyErrorMessage(for: error))
+            }
+        }
+    }
+
+    /// A tap counts as "the same spot" when it lands inside the highlighted
+    /// word's rect (slightly padded) or within a small slop of the original
+    /// tap point. The rect check is primary — the cursor doesn't move during
+    /// a three-finger tap, but the slop also covers the no-geometry case
+    /// (image PDFs) where wordRect is nil. The slop is deliberately tight:
+    /// an adjacent short word can sit closer than any generous radius, and
+    /// tapping IT must start a fresh lookup, not a sentence translation.
+    private static func isRepeatTap(at point: CGPoint, stage: SentenceStage) -> Bool {
+        if let rect = stage.wordRect, rect.insetBy(dx: -4, dy: -4).contains(point) {
+            return true
+        }
+        return hypot(point.x - stage.tapPoint.x, point.y - stage.tapPoint.y) <= 12
+    }
+
+    /// Stream a translation of the whole sentence the popup's word came
+    /// from into the popup's sentence section. Idempotent per stage: a
+    /// third tap on the same spot does nothing (the section is already
+    /// there or streaming). Reuses the translation-only prompt the
+    /// sense-group fallback path uses.
+    private func startSentenceTranslation() {
+        guard var stage = sentenceStage, !stage.requested else { return }
+        stage.requested = true
+        sentenceStage = stage
+        let generation = tapGeneration
+
+        popup.updateSentenceSection("正在翻译整句...")
+
+        var config = AppConfiguration.current
+        config.promptTemplate = PromptBuilder.translationOnlyPromptTemplate
+        let sentence = stage.sentence
+        let selection = WordSelection(
+            word: sentence,
+            context: sentence,
+            wordRangeInContext: 0..<sentence.utf16.count
+        )
+        sentenceTask = Task { @MainActor in
+            @MainActor func stillCurrent() -> Bool {
+                self.tapGeneration == generation && !Task.isCancelled
+            }
+            do {
+                var output = ""
+                for try await delta in self.client.streamExplanation(selection: selection, config: config) {
+                    output += delta
+                    guard stillCurrent() else { return }
+                    let target = SenseGroupResponseRenderer.plainTranslationText(for: output)
+                    self.popup.updateSentenceSection(target.isEmpty ? "正在翻译整句..." : target)
+                }
+                guard stillCurrent() else { return }
+                let target = SenseGroupResponseRenderer.plainTranslationText(for: output)
+                self.popup.updateSentenceSection(target.isEmpty ? "模型没有返回整句译文，请重试。" : target)
+            } catch is CancellationError {
+            } catch {
+                guard stillCurrent() else { return }
+                self.popup.updateSentenceSection("整句翻译失败：\(Self.friendlyErrorMessage(for: error))")
             }
         }
     }

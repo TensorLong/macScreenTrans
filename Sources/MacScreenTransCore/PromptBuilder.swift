@@ -102,6 +102,16 @@ public enum PromptBuilder {
         ]
     }
 
+    /// The single sentence around the clicked word — the same extraction the
+    /// LLM prompt uses. Public for the repeat-tap gesture: a second
+    /// three-finger tap on the same word translates this whole sentence.
+    public static func sentence(for selection: WordSelection) -> String {
+        extractSentenceWithOffset(
+            context: selection.context,
+            anchor: selection.wordRangeInContext
+        ).sentence
+    }
+
     /// Replace every case-insensitive occurrence of `word` inside
     /// `originalSentence` with `___` EXCEPT the one whose UTF-16 range
     /// equals `anchorRangeInSentence`. The clicked occurrence is left

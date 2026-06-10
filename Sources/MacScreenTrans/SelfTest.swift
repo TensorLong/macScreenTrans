@@ -421,7 +421,10 @@ private final class SelfTestDelegate: NSObject, NSApplicationDelegate {
         // fills the whole panel) first, then the anchored tail bubble.
         popup.show(at: NSPoint(x: aim.midX, y: aim.midY), text: "取词中...")
         try? await Task.sleep(nanoseconds: 400_000_000)
-        popup.show(anchoredTo: aim, text: "翻译完成")
+        popup.show(anchoredTo: aim, text: "单词: brown\n意群: quick brown fox\n译文: 敏捷的棕色狐狸")
+        try? await Task.sleep(nanoseconds: 400_000_000)
+        // Second-stage repeat-tap content: divider + full-sentence section.
+        popup.updateSentenceSection("敏捷的棕色狐狸跳过了懒狗。这是整句翻译段落的渲染检查，长文本应该在固定高度的窗口里出现滚动条。")
         try? await Task.sleep(nanoseconds: 1_200_000_000)
 
         let x = Int(aim.midX - 250)

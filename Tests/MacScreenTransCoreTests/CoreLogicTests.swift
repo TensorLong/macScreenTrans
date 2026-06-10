@@ -304,6 +304,20 @@ import CMultitouchSupport
     #expect(position == "The prompt instructs")
 }
 
+@Test func promptBuilderSentenceForSelectionReturnsClickedSentence() {
+    // The repeat-tap gesture translates the whole sentence around the
+    // popup's word. sentence(for:) must return the clicked sentence —
+    // unclozed, boundaries handled like the prompt payload's extraction.
+    let context = "Copy the below prompt into Codex. The prompt instructs Codex to create folders."
+    let secondPrompt = context.utf16Offset(of: "prompt instructs")
+    let selection = WordSelection(
+        word: "prompt",
+        context: context,
+        wordRangeInContext: secondPrompt..<(secondPrompt + 6)
+    )
+    #expect(PromptBuilder.sentence(for: selection) == "The prompt instructs Codex to create folders.")
+}
+
 @Test func promptBuilderNarrowsSentenceToClickedSentenceAcrossChineseBoundary() throws {
     // Chinese full-stop "。" must be recognised as a sentence boundary
     // too, otherwise CJK context windows still send the entire passage
