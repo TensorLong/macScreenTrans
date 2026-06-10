@@ -8,6 +8,12 @@ enum DefaultsKey {
     static let targetLanguage = "targetLanguage"
     static let promptTemplate = "promptTemplate"
     static let promptTemplateVersion = "promptTemplateVersion"
+    // Model catalog cache: newline-joined ids fetched from /v1/models, the
+    // resolved models URL they came from (cache key — a changed endpoint
+    // invalidates the list, a changed API key does not), and the fetch time.
+    static let fetchedModels = "fetchedModels"
+    static let fetchedModelsSource = "fetchedModelsSource"
+    static let fetchedModelsAt = "fetchedModelsAt"
 }
 
 enum AppConfiguration {

@@ -8,13 +8,15 @@ final class SettingsWindowController {
 
     init(onSelfCheck: @escaping () -> String, onTranslateUnderCursor: @escaping () -> Void) {
         let view = SettingsView(onSelfCheck: onSelfCheck, onTranslateUnderCursor: onTranslateUnderCursor)
+        // Fixed-size settings window per macOS HIG: the grouped Form scrolls
+        // internally, so the chrome never needs to resize or zoom.
         window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 720, height: 740),
-            styleMask: [.titled, .closable, .miniaturizable, .resizable],
+            contentRect: NSRect(x: 0, y: 0, width: 680, height: 760),
+            styleMask: [.titled, .closable, .miniaturizable],
             backing: .buffered,
             defer: false
         )
-        window.title = "MacScreenTrans"
+        window.title = "MacScreenTrans 设置"
         // A closable NSWindow defaults to isReleasedWhenClosed == true; with
         // this controller also holding a strong Swift reference, clicking
         // the red close button would over-release the window and crash on
@@ -39,183 +41,342 @@ private struct SettingsView: View {
     @AppStorage(DefaultsKey.model) private var model = AppConfiguration.defaultModel
     @AppStorage(DefaultsKey.targetLanguage) private var targetLanguage = "zh"
     @AppStorage(DefaultsKey.promptTemplate) private var promptTemplate = PromptBuilder.defaultPromptTemplate
+    @AppStorage(DefaultsKey.fetchedModels) private var fetchedModelsStorage = ""
+    @AppStorage(DefaultsKey.fetchedModelsSource) private var fetchedModelsSource = ""
+    @AppStorage(DefaultsKey.fetchedModelsAt) private var fetchedModelsAt = 0.0
 
     let onSelfCheck: () -> String
     let onTranslateUnderCursor: () -> Void
+
     @State private var selfCheckResult = ""
     @State private var permissionGranted = PermissionHelper.screenRecordingGranted
     @State private var connectionResult = ""
     @State private var isTestingConnection = false
     @State private var showSelfCheckResult = false
     @State private var showAdvanced = false
+    @State private var modelFetchPhase = ModelFetchPhase.idle
+    @State private var isCustomModelEntry = false
+    @State private var isCustomLanguageEntry = false
+
+    /// Sentinel Picker tags for the "自定义…" entries. Control characters
+    /// cannot collide with real model ids or language codes.
+    private static let customModelSentinel = "\u{1}custom-model"
+    private static let customLanguageSentinel = "\u{1}custom-language"
+
+    private static let languagePresets: [(code: String, label: String)] = [
+        ("zh", "简体中文"),
+        ("zh-TW", "繁體中文"),
+        ("en", "English"),
+        ("ja", "日本語"),
+        ("ko", "한국어"),
+    ]
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 18) {
-                header
-                statusPanel
-                configurationPanel
-                actionsPanel
-                advancedSettings
-                versionFooter
+        VStack(spacing: 0) {
+            Form {
+                statusSection
+                translationServiceSection
+                languageSection
+                diagnosticsSection
+                advancedSection
             }
-            .padding(24)
+            .formStyle(.grouped)
+
+            Divider()
+            footerBar
         }
-        .background(Color(nsColor: .windowBackgroundColor))
-        .frame(minWidth: 640, minHeight: 640)
+        .frame(width: 680, height: 760)
         .onAppear(perform: refreshStatuses)
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             refreshStatuses()
         }
     }
 
-    private var versionFooter: some View {
-        Text("MacScreenTrans v\(AppConfiguration.appVersion)")
-            .font(.system(size: 11))
-            .foregroundStyle(Color(nsColor: .secondaryLabelColor))
-            .frame(maxWidth: .infinity, alignment: .trailing)
-            .padding(.top, 4)
-    }
+    // MARK: - 状态
 
-    private var header: some View {
-        HStack(alignment: .top, spacing: 14) {
-            Image(nsImage: StatusBarIcon.makeBadge())
-                .resizable()
-                .frame(width: 34, height: 34)
-            VStack(alignment: .leading, spacing: 5) {
-                Text("MacScreenTrans 设置")
-                    .font(.title2)
-                    .fontWeight(.semibold)
-                Text("配置光标取词翻译、屏幕录制权限和模型连接。API Key 不会在状态或结果中显示。")
-                    .foregroundStyle(.secondary)
-            }
-            Spacer()
-            Button("退出") {
-                NSApp.terminate(nil)
-            }
-        }
-    }
-
-    private var statusPanel: some View {
-        Panel("开始使用") {
-            VStack(alignment: .leading, spacing: 14) {
-                HStack(spacing: 12) {
-                    StatusTile(
-                        title: "屏幕录制",
-                        value: permissionGranted ? "已授权" : "需要授权",
-                        detail: permissionGranted ? "可以截取屏幕识别文字" : "请允许 MacScreenTrans 录制屏幕",
+    private var statusSection: some View {
+        Section {
+            LabeledContent("屏幕录制") {
+                HStack(spacing: 10) {
+                    statusLabel(
+                        permissionGranted ? "已授权" : "需要授权",
                         state: permissionGranted ? .good : .warning
                     )
-                    StatusTile(
-                        title: "API 配置",
-                        value: apiConfigurationStatus.value,
-                        detail: apiConfigurationStatus.detail,
-                        state: apiConfigurationStatus.state
-                    )
-                    StatusTile(
-                        title: "监听 / 菜单栏",
-                        value: listeningStatus.value,
-                        detail: listeningStatus.detail,
-                        state: listeningStatus.state
-                    )
+                    if !permissionGranted {
+                        Button("去授权") {
+                            PermissionHelper.openScreenRecordingSettings()
+                        }
+                        .controlSize(.small)
+                    }
                 }
-
-                Text("配置完成后，把鼠标放到文字上，三指轻点触控板即可翻译光标下文本；如果系统弹出“查找”，请在触控板设置里关闭相关手势。")
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
             }
+            .help(permissionGranted ? "可以截取屏幕识别文字" : "请允许 MacScreenTrans 录制屏幕，授权后需重启应用")
+
+            LabeledContent("API 配置") {
+                statusLabel(apiConfigurationStatus.value, state: apiConfigurationStatus.state)
+            }
+            .help(apiConfigurationStatus.detail)
+
+            LabeledContent("取词监听") {
+                statusLabel(listeningStatus.value, state: listeningStatus.state)
+            }
+            .help(listeningStatus.detail)
+        } footer: {
+            Text("配置完成后，把鼠标放到文字上，三指轻点触控板即可翻译光标下文本；如果系统弹出“查找”，请在触控板设置里关闭相关手势。")
         }
     }
 
-    private var configurationPanel: some View {
-        Panel("基础配置") {
-            VStack(alignment: .leading, spacing: 14) {
-                LabeledField("服务地址") {
-                    TextField("https://openrouter.ai/api/v1", text: $endpoint)
+    private func statusLabel(_ text: String, state: StatusState) -> some View {
+        Label(text, systemImage: state.symbol)
+            .foregroundStyle(state.color)
+    }
+
+    // MARK: - 翻译服务
+
+    private var translationServiceSection: some View {
+        Section {
+            VStack(alignment: .leading, spacing: 4) {
+                TextField("服务地址", text: $endpoint, prompt: Text(EndpointResolver.defaultBaseURL))
+                    .autocorrectionDisabled()
+                endpointCaption
+            }
+
+            LabeledContent("API Key") {
+                RevealableSecureField(text: $apiKey)
+            }
+
+            VStack(alignment: .leading, spacing: 6) {
+                LabeledContent("模型") {
+                    HStack(spacing: 8) {
+                        modelPicker
+                        fetchModelsButton
+                    }
+                }
+                if isCustomModelEntry {
+                    TextField("输入模型 ID，如 openai/gpt-4o-mini", text: $model)
                         .textFieldStyle(.roundedBorder)
-                        .disableAutocorrection(true)
+                        .autocorrectionDisabled()
+                        .onSubmit {
+                            if cachedModels.contains(model) {
+                                isCustomModelEntry = false
+                            }
+                        }
                 }
+                modelCatalogCaption
+            }
 
-                LabeledField("API Key") {
-                    SecureField("OpenAI-compatible API Key（本地服务可留空）", text: $apiKey)
-                        .textFieldStyle(.roundedBorder)
-                }
-
-                HStack(alignment: .top, spacing: 14) {
-                    LabeledField("模型") {
-                        TextField("openai/gpt-4o-mini", text: $model)
-                            .textFieldStyle(.roundedBorder)
+            HStack {
+                Spacer()
+                Button {
+                    testConnection()
+                } label: {
+                    Group {
+                        if isTestingConnection {
+                            ProgressView()
+                                .controlSize(.small)
+                        } else {
+                            Label("测试连接", systemImage: "network")
+                        }
                     }
-                    LabeledField("目标语言") {
-                        TextField("zh", text: $targetLanguage)
-                            .textFieldStyle(.roundedBorder)
-                            .frame(width: 120)
-                    }
+                    .frame(minWidth: 96)
                 }
+                .disabled(isTestingConnection || testConnectionBlocker != nil)
+                .help(testConnectionBlocker ?? "用当前配置发起一次真实翻译，验证地址、Key 和模型")
+            }
 
-                Text("服务地址会自动补全 `/v1/chat/completions`；API Key 仅通过安全输入框编辑。")
-                    .font(.footnote)
+            if !connectionResult.isEmpty {
+                ResultBox(text: connectionResult)
+            }
+        } header: {
+            Text("翻译服务")
+        } footer: {
+            Text("服务地址会自动补全 `/v1/chat/completions`。API Key 仅保存在本机，不会在状态或结果中显示；本地服务（Ollama、LM Studio）可留空。")
+        }
+    }
+
+    private var endpointCaption: some View {
+        Group {
+            if let url = EndpointResolver.chatCompletionsURL(baseURL: endpoint) {
+                Text("实际请求：\(url.absoluteString)")
                     .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                Text("地址无效：需以 http:// 或 https:// 开头")
+                    .foregroundStyle(.red)
+            }
+        }
+        .font(.caption)
+        .textSelection(.enabled)
+    }
+
+    private var modelPicker: some View {
+        Picker("", selection: modelPickerSelection) {
+            if !cachedModels.contains(model) {
+                Text(model.isEmpty ? "（未设置）" : "\(model)（自定义）").tag(model)
+                Divider()
+            }
+            ForEach(cachedModels, id: \.self) { id in
+                Text(id).tag(id)
+            }
+            Divider()
+            Text("自定义…").tag(Self.customModelSentinel)
+        }
+        .pickerStyle(.menu)
+        .labelsHidden()
+    }
+
+    private var modelPickerSelection: Binding<String> {
+        Binding(
+            get: {
+                isCustomModelEntry ? Self.customModelSentinel : model
+            },
+            set: { newValue in
+                if newValue == Self.customModelSentinel {
+                    isCustomModelEntry = true
+                } else {
+                    isCustomModelEntry = false
+                    model = newValue
+                }
+            }
+        )
+    }
+
+    private var fetchModelsButton: some View {
+        Button {
+            fetchModels()
+        } label: {
+            Group {
+                if modelFetchPhase == .loading {
+                    ProgressView()
+                        .controlSize(.small)
+                } else {
+                    Image(systemName: "arrow.clockwise")
+                }
+            }
+            .frame(minWidth: 24)
+        }
+        .disabled(modelFetchPhase == .loading || modelsURL == nil)
+        .accessibilityLabel("获取模型列表")
+        .help(modelsURL == nil
+            ? "需要先填写有效的服务地址（http/https）"
+            : "获取模型列表：从 \(modelsURL!.absoluteString) 拉取可用模型")
+    }
+
+    @ViewBuilder private var modelCatalogCaption: some View {
+        switch modelFetchPhase {
+        case let .failed(message):
+            HStack(spacing: 8) {
+                Text(message)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .textSelection(.enabled)
+                Button("重试") {
+                    fetchModels()
+                }
+                .controlSize(.small)
+            }
+        case .unsupported:
+            Text("该服务不支持模型列表接口，请手动输入模型 ID。")
+                .font(.caption)
+                .foregroundStyle(.orange)
+        case .idle, .loading:
+            if !cachedModels.isEmpty {
+                let fetchedAt = Date(timeIntervalSince1970: fetchedModelsAt)
+                Text("已获取 \(cachedModels.count) 个模型 · \(fetchedAt.formatted(date: .abbreviated, time: .shortened))")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
         }
     }
 
-    private var actionsPanel: some View {
-        Panel("操作") {
-            VStack(alignment: .leading, spacing: 12) {
-                LazyVGrid(columns: [GridItem(.adaptive(minimum: 170), spacing: 10)], alignment: .leading, spacing: 10) {
-                    Button {
-                        testConnection()
-                    } label: {
-                        Label(isTestingConnection ? "正在测试..." : "测试连接", systemImage: "network")
-                    }
-                    .disabled(isTestingConnection)
-                    .frame(maxWidth: .infinity)
+    // MARK: - 取词与语言
 
-                    Button {
-                        runSelfCheck()
-                    } label: {
-                        Label("权限自检", systemImage: "checkmark.shield")
+    private var languageSection: some View {
+        Section("翻译目标") {
+            VStack(alignment: .leading, spacing: 6) {
+                LabeledContent("目标语言") {
+                    Picker("", selection: languagePickerSelection) {
+                        if !Self.languagePresets.contains(where: { $0.code == targetLanguage }) {
+                            Text("\(targetLanguage)（自定义）").tag(targetLanguage)
+                            Divider()
+                        }
+                        ForEach(Self.languagePresets, id: \.code) { preset in
+                            Text("\(preset.label)（\(preset.code)）").tag(preset.code)
+                        }
+                        Divider()
+                        Text("自定义…").tag(Self.customLanguageSentinel)
                     }
-                    .frame(maxWidth: .infinity)
-
-                    Button {
-                        PermissionHelper.openScreenRecordingSettings()
-                    } label: {
-                        Label("打开屏幕录制设置", systemImage: "gearshape")
-                    }
-                    .frame(maxWidth: .infinity)
-
-                    Button {
-                        PermissionHelper.openTrackpadSettings()
-                    } label: {
-                        Label("打开触控板设置", systemImage: "hand.tap")
-                    }
-                    .frame(maxWidth: .infinity)
-
-                    Button {
-                        triggerTranslateUnderCursor()
-                    } label: {
-                        Label("翻译光标下文本", systemImage: "text.cursor")
-                    }
-                    .frame(maxWidth: .infinity)
+                    .pickerStyle(.menu)
+                    .labelsHidden()
+                    .frame(maxWidth: 240)
                 }
-                .buttonStyle(.bordered)
-
-                if !connectionResult.isEmpty {
-                    ResultBox(text: connectionResult)
-                }
-
-                if showSelfCheckResult, !selfCheckResult.isEmpty {
-                    ResultBox(text: friendlySelfCheckResult)
+                if isCustomLanguageEntry {
+                    TextField("输入语言代码，如 fr、de", text: $targetLanguage)
+                        .textFieldStyle(.roundedBorder)
+                        .autocorrectionDisabled()
+                        .frame(maxWidth: 240)
                 }
             }
         }
     }
 
-    private var advancedSettings: some View {
-        Panel("高级") {
+    private var languagePickerSelection: Binding<String> {
+        Binding(
+            get: {
+                isCustomLanguageEntry ? Self.customLanguageSentinel : targetLanguage
+            },
+            set: { newValue in
+                if newValue == Self.customLanguageSentinel {
+                    isCustomLanguageEntry = true
+                } else {
+                    isCustomLanguageEntry = false
+                    targetLanguage = newValue
+                }
+            }
+        )
+    }
+
+    // MARK: - 诊断与权限
+
+    private var diagnosticsSection: some View {
+        Section("诊断与权限") {
+            HStack(spacing: 10) {
+                Button {
+                    runSelfCheck()
+                } label: {
+                    Label("权限自检", systemImage: "checkmark.shield")
+                }
+                Button {
+                    triggerTranslateUnderCursor()
+                } label: {
+                    Label("翻译光标下文本", systemImage: "text.cursor")
+                }
+                Spacer()
+            }
+
+            HStack(spacing: 10) {
+                Button {
+                    PermissionHelper.openScreenRecordingSettings()
+                } label: {
+                    Label("屏幕录制设置", systemImage: "rectangle.dashed.badge.record")
+                }
+                Button {
+                    PermissionHelper.openTrackpadSettings()
+                } label: {
+                    Label("触控板设置", systemImage: "hand.tap")
+                }
+                Spacer()
+            }
+
+            if showSelfCheckResult, !selfCheckResult.isEmpty {
+                ResultBox(text: friendlySelfCheckResult)
+            }
+        }
+    }
+
+    // MARK: - 高级
+
+    private var advancedSection: some View {
+        Section {
             DisclosureGroup("Prompt 与模型行为", isExpanded: $showAdvanced) {
                 VStack(alignment: .leading, spacing: 10) {
                     HStack {
@@ -236,16 +397,117 @@ private struct SettingsView: View {
                             RoundedRectangle(cornerRadius: 8)
                                 .stroke(Color.secondary.opacity(0.24))
                         )
-
-                    Text("支持 `{word}`、`{context}`、`{target_language}` 等占位符，修改会立即保存。")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
                 }
                 .padding(.top, 10)
             }
+        } header: {
+            Text("高级")
+        } footer: {
+            Text("支持 `{word}`、`{context}`、`{target_language}` 等占位符，修改会立即保存。")
         }
     }
+
+    private var footerBar: some View {
+        HStack {
+            Text("MacScreenTrans v\(AppConfiguration.appVersion)")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Spacer()
+            Button("退出 MacScreenTrans") {
+                NSApp.terminate(nil)
+            }
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 10)
+    }
+
+    // MARK: - 模型列表获取
+
+    private enum ModelFetchPhase: Equatable {
+        case idle
+        case loading
+        case unsupported
+        case failed(String)
+    }
+
+    /// The resolved `/v1/models` URL — doubles as the cache key, so a changed
+    /// endpoint automatically invalidates the cached list while an API key
+    /// change keeps it (model catalogs belong to hosts, not keys).
+    private var modelsURL: URL? {
+        EndpointResolver.endpointURL(baseURL: endpoint, path: ModelCatalogClient.modelsPath)
+    }
+
+    private var cachedModels: [String] {
+        guard !fetchedModelsSource.isEmpty,
+              fetchedModelsSource == modelsURL?.absoluteString else {
+            return []
+        }
+        return fetchedModelsStorage
+            .split(separator: "\n")
+            .map(String.init)
+            .filter { !$0.isEmpty }
+    }
+
+    private func fetchModels() {
+        guard modelFetchPhase != .loading, let url = modelsURL else { return }
+        modelFetchPhase = .loading
+
+        let endpoint = endpoint
+        let apiKey = apiKey
+        let source = url.absoluteString
+
+        Task {
+            do {
+                let ids = try await ModelCatalogClient().fetchModelIDs(endpoint: endpoint, apiKey: apiKey)
+                await MainActor.run {
+                    guard !ids.isEmpty else {
+                        // An empty (or unsupported) catalog must never wipe an
+                        // existing cache or the configured model — manual
+                        // entry stays a first-class path.
+                        modelFetchPhase = .unsupported
+                        return
+                    }
+                    fetchedModelsStorage = ids.joined(separator: "\n")
+                    fetchedModelsSource = source
+                    fetchedModelsAt = Date().timeIntervalSince1970
+                    modelFetchPhase = .idle
+                }
+            } catch {
+                await MainActor.run {
+                    modelFetchPhase = Self.fetchFailurePhase(for: error)
+                }
+            }
+        }
+    }
+
+    private static func fetchFailurePhase(for error: Error) -> ModelFetchPhase {
+        guard let catalogError = error as? ModelCatalogError else {
+            return .failed("获取失败：\(error.localizedDescription)")
+        }
+        switch catalogError {
+        case .malformedResponse, .httpFailure(404, _):
+            return .unsupported
+        case .invalidEndpoint:
+            return .failed("获取失败：服务地址无效。")
+        case .invalidHTTPResponse:
+            return .failed("获取失败：服务返回了无法识别的响应。")
+        case let .httpFailure(status, _):
+            let hint: String
+            switch status {
+            case 401, 403:
+                hint = "API Key 无效或权限不足。"
+            case 429:
+                hint = "请求过于频繁或额度不足。"
+            case 500...599:
+                hint = "服务端暂时不可用。"
+            default:
+                hint = "HTTP \(status)。"
+            }
+            return .failed("获取失败：\(hint)")
+        }
+    }
+
+    // MARK: - 状态计算
 
     private var apiConfigurationStatus: (value: String, detail: String, state: StatusState) {
         let endpointOK = EndpointResolver.chatCompletionsURL(baseURL: endpoint) != nil
@@ -256,7 +518,7 @@ private struct SettingsView: View {
             return ("服务地址无效", "请填写 OpenAI 兼容接口地址（http/https）", .bad)
         }
         guard modelOK else {
-            return ("缺少模型名", "请填写可用模型", .warning)
+            return ("缺少模型名", "请选择或填写可用模型", .warning)
         }
         guard apiKeyOK else {
             return ("已配置（无 Key）", "本地服务（如 Ollama）可留空 API Key", .good)
@@ -297,12 +559,26 @@ private struct SettingsView: View {
         refreshStatuses()
         connectionResult = permissionGranted
             ? "已请求翻译。请在 2 秒内把鼠标移到要翻译的文字上，然后查看光标附近的弹窗。"
-            : "需要屏幕录制权限。点击“打开屏幕录制设置”授权 MacScreenTrans 后重启应用。"
+            : "需要屏幕录制权限。点击“屏幕录制设置”授权 MacScreenTrans 后重启应用。"
         onTranslateUnderCursor()
     }
 
+    // MARK: - 测试连接
+
+    /// Non-nil when the test-connection button must stay disabled; the value
+    /// is the exact missing prerequisite, surfaced via `.help()`.
+    private var testConnectionBlocker: String? {
+        guard EndpointResolver.chatCompletionsURL(baseURL: endpoint) != nil else {
+            return "需要先填写有效的服务地址（http/https）"
+        }
+        guard !model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return "需要先选择或填写模型"
+        }
+        return nil
+    }
+
     private func testConnection() {
-        guard !isTestingConnection else { return }
+        guard !isTestingConnection, testConnectionBlocker == nil else { return }
 
         let config = TranslationConfig(
             endpoint: endpoint,
@@ -311,15 +587,6 @@ private struct SettingsView: View {
             targetLanguage: targetLanguage,
             promptTemplate: promptTemplate
         )
-
-        guard EndpointResolver.chatCompletionsURL(baseURL: config.endpoint) != nil else {
-            connectionResult = "服务地址无效。请检查是否为 OpenAI 兼容接口地址（http/https）。"
-            return
-        }
-        guard !config.model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            connectionResult = "缺少模型名。请填写一个可用模型。"
-            return
-        }
 
         isTestingConnection = true
         connectionResult = "正在测试连接..."
@@ -388,82 +655,54 @@ private struct SettingsView: View {
     }
 }
 
-private struct Panel<Content: View>: View {
-    let title: String
-    @ViewBuilder let content: Content
+/// SecureField with an eye toggle that reveals the key as plain text.
+/// The two fields share one binding and swap via opacity so the toggle
+/// preserves the caret/focus; the key re-masks whenever the app deactivates.
+private struct RevealableSecureField: View {
+    @Binding var text: String
 
-    init(_ title: String, @ViewBuilder content: () -> Content) {
-        self.title = title
-        self.content = content()
+    @State private var revealed = false
+    @FocusState private var focusedField: Field?
+
+    private enum Field {
+        case secure
+        case plain
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Text(title)
-                .font(.headline)
-            content
-        }
-        .padding(16)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color(nsColor: .controlBackgroundColor))
-        .clipShape(RoundedRectangle(cornerRadius: 8))
-    }
-}
+        HStack(spacing: 6) {
+            // Conditional swap, not a ZStack opacity cross-fade: the
+            // AppKit-backed hidden twin still paints its placeholder at
+            // opacity 0, ghosting "可留空" on top of the secure dots.
+            Group {
+                if revealed {
+                    TextField("", text: $text)
+                        .autocorrectionDisabled()
+                        .focused($focusedField, equals: .plain)
+                } else {
+                    SecureField("", text: $text)
+                        .focused($focusedField, equals: .secure)
+                }
+            }
+            .multilineTextAlignment(.trailing)
 
-private struct LabeledField<Content: View>: View {
-    let title: String
-    @ViewBuilder let content: Content
-
-    init(_ title: String, @ViewBuilder content: () -> Content) {
-        self.title = title
-        self.content = content()
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text(title)
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
-            content
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-    }
-}
-
-private struct StatusTile: View {
-    let title: String
-    let value: String
-    let detail: String
-    let state: StatusState
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 7) {
-                Circle()
-                    .fill(state.color)
-                    .frame(width: 9, height: 9)
-                Text(title)
-                    .font(.caption)
+            Button {
+                let wasFocused = focusedField != nil
+                revealed.toggle()
+                if wasFocused {
+                    focusedField = revealed ? .plain : .secure
+                }
+            } label: {
+                Image(systemName: revealed ? "eye.slash" : "eye")
                     .foregroundStyle(.secondary)
             }
-
-            Text(value)
-                .font(.headline)
-
-            Text(detail)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .lineLimit(2)
-                .fixedSize(horizontal: false, vertical: true)
+            .buttonStyle(.borderless)
+            .accessibilityLabel(revealed ? "隐藏 API Key" : "显示 API Key")
+            .help(revealed ? "隐藏 API Key" : "显示 API Key")
         }
-        .padding(12)
-        .frame(maxWidth: .infinity, minHeight: 112, alignment: .topLeading)
-        .background(state.color.opacity(0.10))
-        .overlay(
-            RoundedRectangle(cornerRadius: 8)
-                .stroke(state.color.opacity(0.22))
-        )
-        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.willResignActiveNotification)) { _ in
+            revealed = false
+        }
     }
 }
 
@@ -497,6 +736,19 @@ private enum StatusState {
             return .red
         case .neutral:
             return .secondary
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .good:
+            return "checkmark.circle.fill"
+        case .warning:
+            return "exclamationmark.triangle.fill"
+        case .bad:
+            return "xmark.octagon.fill"
+        case .neutral:
+            return "circle.dashed"
         }
     }
 }
