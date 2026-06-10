@@ -245,12 +245,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         let config = AppConfiguration.current
-        guard !config.apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            popup.update("请先在设置里配置 API key。")
-            settingsWindow?.show()
-            return
-        }
-
         popup.update("正在解释：\(selection.word)\n\n")
         let lookupBox = PhraseLookupBox(result: result)
         // Compute the 3-word verbatim position string once per resolve.
@@ -413,8 +407,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         switch streamingError {
-        case .missingAPIKey:
-            return "缺少 API Key。\n请在设置页填写 OpenRouter 或 OpenAI-compatible API key。"
+        case let .serverError(message):
+            return "服务端返回错误：\(message)\n请检查模型名和服务状态后重试。"
         case .invalidEndpoint:
             return "Endpoint URL 无效。\n请检查设置页中的 API URL，例如 https://openrouter.ai/api/v1。"
         case .invalidHTTPResponse:
@@ -442,6 +436,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let endpointOK = EndpointResolver.chatCompletionsURL(baseURL: config.endpoint) != nil
         let apiKeyOK = !config.apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         let modelOK = !config.model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        let apiKeyStatus = apiKeyOK ? "已配置" : "未填写（本地服务可留空）"
         let trackpadStatus = trackpadMonitor.isRunning
             ? "运行中"
             : "未运行\(trackpadMonitor.lastError.map { ": \($0)" } ?? "")"
@@ -450,7 +445,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         屏幕录制权限：\(PermissionHelper.screenRecordingGranted ? "已授权" : "未授权")
         三指轻点监听：\(trackpadStatus)
         Endpoint：\(endpointOK ? "正常" : "无效")
-        API Key：\(apiKeyOK ? "已配置" : "缺失")
+        API Key：\(apiKeyStatus)
         Model：\(modelOK ? "已配置" : "缺失")
         目标语言：\(config.targetLanguage)
         最近一次手势判定：\(trackpadMonitor.lastRejection)

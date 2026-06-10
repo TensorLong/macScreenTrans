@@ -136,7 +136,7 @@ private struct SettingsView: View {
                 }
 
                 LabeledField("API Key") {
-                    SecureField("粘贴 OpenAI-compatible API Key", text: $apiKey)
+                    SecureField("OpenAI-compatible API Key（本地服务可留空）", text: $apiKey)
                         .textFieldStyle(.roundedBorder)
                 }
 
@@ -252,13 +252,13 @@ private struct SettingsView: View {
         let modelOK = !model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
 
         guard endpointOK else {
-            return ("服务地址无效", "请填写 https:// 开头的兼容接口", .bad)
-        }
-        guard apiKeyOK else {
-            return ("缺少 API Key", "填写后才能请求模型", .warning)
+            return ("服务地址无效", "请填写 OpenAI 兼容接口地址（http/https）", .bad)
         }
         guard modelOK else {
             return ("缺少模型名", "请填写可用模型", .warning)
+        }
+        guard apiKeyOK else {
+            return ("已配置（无 Key）", "本地服务（如 Ollama）可留空 API Key", .good)
         }
         return ("已配置", "可进行连接测试", .good)
     }
@@ -312,11 +312,7 @@ private struct SettingsView: View {
         )
 
         guard EndpointResolver.chatCompletionsURL(baseURL: config.endpoint) != nil else {
-            connectionResult = "服务地址无效。请检查是否为 https:// 开头的 OpenAI 兼容接口地址。"
-            return
-        }
-        guard !config.apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            connectionResult = "缺少 API Key。填写后再测试连接。"
+            connectionResult = "服务地址无效。请检查是否为 OpenAI 兼容接口地址（http/https）。"
             return
         }
         guard !config.model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
@@ -366,8 +362,8 @@ private struct SettingsView: View {
             return "请求失败：\(error.localizedDescription)"
         }
         switch streamingError {
-        case .missingAPIKey:
-            return "缺少 API Key。"
+        case let .serverError(message):
+            return "服务端返回错误：\(message)"
         case .invalidEndpoint:
             return "服务地址无效。"
         case .invalidHTTPResponse:

@@ -1,21 +1,24 @@
 import Foundation
 
 public enum OpenAIStreamingError: LocalizedError {
-    case missingAPIKey
     case invalidEndpoint
     case invalidHTTPResponse
     case httpFailure(Int, String)
+    /// The server answered HTTP 200 but delivered the failure as an
+    /// in-stream `{"error": ...}` payload (LiteLLM, vLLM, Ollama runner
+    /// crashes mid-generation all do this).
+    case serverError(String)
 
     public var errorDescription: String? {
         switch self {
-        case .missingAPIKey:
-            return "API key is not configured"
         case .invalidEndpoint:
             return "LLM endpoint is invalid"
         case .invalidHTTPResponse:
             return "LLM endpoint returned an invalid response"
         case let .httpFailure(status, body):
             return "LLM request failed with HTTP \(status): \(body)"
+        case let .serverError(message):
+            return "LLM server reported an error: \(message)"
         }
     }
 }
@@ -25,8 +28,11 @@ public final class OpenAIStreamingClient: Sendable {
 
     public convenience init() {
         let configuration = URLSessionConfiguration.default
-        configuration.timeoutIntervalForRequest = 20
-        configuration.timeoutIntervalForResource = 60
+        // Generous enough for a local 7B model cold-loading off disk on a
+        // slower machine; measured Apple-Silicon cold starts are ~6s to
+        // first byte, but Intel + memory pressure can multiply that.
+        configuration.timeoutIntervalForRequest = 30
+        configuration.timeoutIntervalForResource = 180
         self.init(session: URLSession(configuration: configuration))
     }
 
@@ -56,9 +62,6 @@ public final class OpenAIStreamingClient: Sendable {
         config: TranslationConfig,
         continuation: AsyncThrowingStream<String, Error>.Continuation
     ) async throws {
-        guard !config.apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            throw OpenAIStreamingError.missingAPIKey
-        }
         guard let url = EndpointResolver.chatCompletionsURL(baseURL: config.endpoint) else {
             throw OpenAIStreamingError.invalidEndpoint
         }
@@ -73,9 +76,15 @@ public final class OpenAIStreamingClient: Sendable {
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
-        request.timeoutInterval = 20
+        request.timeoutInterval = 30
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue("Bearer \(config.apiKey)", forHTTPHeaderField: "Authorization")
+        // Keyless local endpoints (Ollama, LM Studio) are first-class: only
+        // send Authorization when a key is actually configured and let the
+        // server 401 if it wanted one.
+        let trimmedKey = config.apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedKey.isEmpty {
+            request.setValue("Bearer \(trimmedKey)", forHTTPHeaderField: "Authorization")
+        }
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
         let (bytes, response) = try await session.bytes(for: request)
@@ -94,6 +103,9 @@ public final class OpenAIStreamingClient: Sendable {
 
         for try await line in bytes.lines {
             try Task.checkCancellation()
+            if let message = ChatCompletionStreamParser.errorMessage(fromSSELine: line) {
+                throw OpenAIStreamingError.serverError(message)
+            }
             if let delta = ChatCompletionStreamParser.contentDelta(fromSSELine: line) {
                 continuation.yield(delta)
             }

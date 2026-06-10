@@ -66,9 +66,10 @@ enum AppConfiguration {
     }
 
     static var hasMinimumLLMConfig: Bool {
+        // The API key is deliberately NOT required: keyless local endpoints
+        // (Ollama, LM Studio) are a first-class configuration.
         let config = current
-        return !config.apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
-            EndpointResolver.chatCompletionsURL(baseURL: config.endpoint) != nil &&
+        return EndpointResolver.chatCompletionsURL(baseURL: config.endpoint) != nil &&
             !config.model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
