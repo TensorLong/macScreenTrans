@@ -295,7 +295,7 @@ private struct SettingsView: View {
     private func triggerTranslateUnderCursor() {
         refreshStatuses()
         connectionResult = permissionGranted
-            ? "已请求翻译光标下文本。请查看光标附近的弹窗。"
+            ? "已请求翻译。请在 2 秒内把鼠标移到要翻译的文字上，然后查看光标附近的弹窗。"
             : "需要屏幕录制权限。点击“打开屏幕录制设置”授权 MacScreenTrans 后重启应用。"
         onTranslateUnderCursor()
     }

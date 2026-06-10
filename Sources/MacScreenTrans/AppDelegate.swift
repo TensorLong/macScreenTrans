@@ -164,7 +164,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func translateUnderCursor() {
-        handleThreeFingerTap()
+        // Click-driven triggers (menu item, settings button) leave the
+        // cursor on the control that was clicked — sampling mouseLocation
+        // immediately would OCR the menu bar or the settings window. Give
+        // the user a beat to move the cursor onto the target text. The
+        // global hotkey path calls handleThreeFingerTap directly because
+        // the cursor is already where the user wants it.
+        tapGeneration += 1
+        let generation = tapGeneration
+        popup.show(at: NSEvent.mouseLocation, text: "请在 2 秒内把鼠标移到要翻译的文字上...")
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            guard self.tapGeneration == generation else { return }
+            self.handleThreeFingerTap()
+        }
     }
 
     @objc private func startListening() {
