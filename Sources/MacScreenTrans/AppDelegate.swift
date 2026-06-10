@@ -1,27 +1,6 @@
 import AppKit
 import MacScreenTransCore
 
-/// Diagnostic logger used while hunting the duplicate-word anchor bug.
-/// Appends one line per call to `/tmp/macscreentrans-debug.log`. Remove
-/// this and its call sites once the root cause is fixed.
-fileprivate func dlog(_ line: String) {
-#if DEBUG
-    let stamp = ISO8601DateFormatter().string(from: Date())
-    let entry = "[\(stamp)] \(line)\n"
-    guard let data = entry.data(using: .utf8) else { return }
-    let url = URL(fileURLWithPath: "/tmp/macscreentrans-debug.log")
-    if !FileManager.default.fileExists(atPath: url.path) {
-        try? data.write(to: url)
-        return
-    }
-    if let handle = try? FileHandle(forWritingTo: url) {
-        defer { try? handle.close() }
-        _ = try? handle.seekToEnd()
-        try? handle.write(contentsOf: data)
-    }
-#endif
-}
-
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let trackpadMonitor = TrackpadTapMonitor()
@@ -43,7 +22,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private lazy var shortcutMonitor = GlobalShortcutMonitor()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        dlog("=== app launched pid=\(getpid()) ===")
         AppConfiguration.bootstrapDefaults()
         configureApplicationMenu()
         configureStatusItem()
@@ -190,10 +168,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         highlightOverlay.hide()
         phraseOverlay.hide()
         let point = NSEvent.mouseLocation
-        dlog("=== handleThreeFingerTap entered at point=\(point) ===")
 
         guard PermissionHelper.screenRecordingGranted else {
-            dlog("early-return: screen-recording-not-granted")
             PermissionHelper.requestScreenRecording()
             popup.show(
                 at: point,
@@ -207,7 +183,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // with a populated diagnostic, and we show the same compact popup
         // (no LLM round-trip) the role gate used to.
         guard let result = OCRWordReader.resolve(at: point) else {
-            dlog("early-return: resolve-nil ocr_diagnostic=\(OCRWordReader.lastDiagnostic.debugDescription)")
             popup.show(
                 at: point,
                 text: """
@@ -221,32 +196,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         let selection = result.selection
-
-        dlog("--- new resolve ---")
-        dlog("word=\(selection.word.debugDescription)")
-        dlog("wordRangeInContext=\(selection.wordRangeInContext)")
-        dlog("wordRangeInSource=\(String(describing: selection.wordRangeInSource))")
-        dlog("context=\(selection.context.debugDescription)")
-        dlog("wordRect=\(String(describing: result.wordRect))")
-        dlog("clickedWordRangeInLookupText=\(String(describing: result.clickedWordRangeInLookupText))")
-        dlog("ocr_diagnostic=\(OCRWordReader.lastDiagnostic.debugDescription)")
-        let _ctxUTF16 = selection.context.utf16
-        let _s = selection.wordRangeInContext.lowerBound
-        let _e = selection.wordRangeInContext.upperBound
-        var _marked: String = selection.context
-        if _s >= 0, _e >= _s, _e <= _ctxUTF16.count {
-            let _sUTF16 = _ctxUTF16.index(_ctxUTF16.startIndex, offsetBy: _s)
-            let _eUTF16 = _ctxUTF16.index(_ctxUTF16.startIndex, offsetBy: _e)
-            if let _sIdx = _sUTF16.samePosition(in: selection.context),
-               let _eIdx = _eUTF16.samePosition(in: selection.context) {
-                _marked = selection.context[selection.context.startIndex..<_sIdx]
-                    + "«"
-                    + selection.context[_sIdx..<_eIdx]
-                    + "»"
-                    + selection.context[_eIdx..<selection.context.endIndex]
-            }
-        }
-        dlog("markedSentence=\(_marked.debugDescription)")
 
         // Show the popup anchored to the recognized word's screen rect when
         // AX gives us bounds. Otherwise fall back to the cursor — this still
@@ -293,9 +242,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         popup.update("模型没有返回内容。")
                     }
                 } else if let response = SenseGroupResponseRenderer.response(for: output) {
-                    dlog("raw_output=\(output.debugDescription)")
-                    dlog("response.source=\(response.source.debugDescription)")
-                    dlog("response.target=\(response.target.debugDescription)")
                     // Reveal the green phrase overlay as soon as the LLM gives us
                     // a usable source phrase, regardless of whether we'll later
                     // fall through to the translation-only fallback. Per-line
@@ -308,11 +254,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         let phrase = response.source
                         await MainActor.run {
                             let segs = lookupBox.result.phraseSegments(for: phrase, positionString: positionString)
-                            dlog("phrase=\(phrase.debugDescription) segs.count=\(segs.count)")
-                            for (i, seg) in segs.enumerated() {
-                                dlog("  seg[\(i)] rangeInElementText=\(seg.rangeInElementText) rect=\(seg.rect) text=\(seg.text.debugDescription)")
-                            }
-                            dlog("ocr_diagnostic_after_segments=\(OCRWordReader.lastDiagnostic.debugDescription)")
                             if !segs.isEmpty {
                                 let phraseFont: NSFont?
                                 if let wordRect = lookupBox.result.wordRect {
