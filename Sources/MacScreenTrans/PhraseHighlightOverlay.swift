@@ -17,6 +17,10 @@ import AppKit
 final class PhraseHighlightOverlayController {
     private let panel: NSPanel
     private let view: PhraseHighlightView
+    /// Same staleness guard as WordHighlightOverlayController: a hide's
+    /// fade-out completion must not order out a panel that a newer show()
+    /// already re-displayed.
+    private var generation = 0
 
     init() {
         let initialFrame = NSRect(x: 0, y: 0, width: 10, height: 10)
@@ -30,6 +34,8 @@ final class PhraseHighlightOverlayController {
         // on top of the green phrase band automatically when both panels
         // overlap on screen.
         panel.level = .floating
+        // Keep the highlight out of our own OCR screen captures.
+        panel.sharingType = .none
         panel.collectionBehavior = [.canJoinAllSpaces, .transient, .ignoresCycle]
         panel.isOpaque = false
         panel.backgroundColor = .clear
@@ -56,6 +62,7 @@ final class PhraseHighlightOverlayController {
             hide()
             return
         }
+        generation += 1
 
         // Union the segment rects, then pad. Same horizontal+vertical
         // padding as WordHighlightOverlay so a single-segment phrase looks
@@ -101,6 +108,8 @@ final class PhraseHighlightOverlayController {
 
     func hide() {
         guard panel.isVisible else { return }
+        generation += 1
+        let expected = generation
         NSAnimationContext.runAnimationGroup({ ctx in
             ctx.duration = 0.1
             panel.animator().alphaValue = 0
@@ -108,7 +117,8 @@ final class PhraseHighlightOverlayController {
             // Completion fires on the main thread; Swift 6 isolation
             // analysis still flags NSPanel access as cross-actor, so hop
             // back onto MainActor before touching it.
-            Task { @MainActor in
+            Task { @MainActor [weak self] in
+                guard self?.generation == expected else { return }
                 panel.orderOut(nil)
             }
         })

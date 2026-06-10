@@ -15,6 +15,13 @@ final class SettingsWindowController {
             defer: false
         )
         window.title = "MacScreenTrans"
+        // A closable NSWindow defaults to isReleasedWhenClosed == true; with
+        // this controller also holding a strong Swift reference, clicking
+        // the red close button would over-release the window and crash on
+        // the next show(). Keep ownership purely with ARC.
+        window.isReleasedWhenClosed = false
+        // Keep the settings window out of our own OCR screen captures.
+        window.sharingType = .none
         window.contentView = NSHostingView(rootView: view)
         window.center()
     }

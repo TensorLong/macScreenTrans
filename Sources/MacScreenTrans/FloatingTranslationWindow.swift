@@ -76,6 +76,10 @@ final class FloatingTranslationWindowController {
         // overlay at .floating can never z-order on top of us and cover
         // the tail tip.
         panel.level = .popUpMenu
+        // Exclude the popup from CGWindowListCreateImage captures: the OCR
+        // strip is grabbed while this panel may still be on screen, and a
+        // captured popup would feed our own UI text back into the pipeline.
+        panel.sharingType = .none
         panel.collectionBehavior = [.canJoinAllSpaces, .transient]
         panel.backgroundColor = .clear
         panel.isOpaque = false

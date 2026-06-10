@@ -12,6 +12,11 @@ import AppKit
 final class WordHighlightOverlayController {
     private let panel: NSPanel
     private let highlightView: HighlightView
+    /// Bumped on every show()/hide(). A hide's fade-out completion only
+    /// orders the panel out when no newer show()/hide() superseded it —
+    /// otherwise a stale completion (queued while the main thread was busy)
+    /// would remove a highlight that was just re-shown.
+    private var generation = 0
 
     init() {
         let initialFrame = NSRect(x: 0, y: 0, width: 10, height: 10)
@@ -25,6 +30,8 @@ final class WordHighlightOverlayController {
         // never hides behind the host app's own subviews during the brief
         // moment before the translation popup appears.
         panel.level = .popUpMenu
+        // Keep the highlight out of our own OCR screen captures.
+        panel.sharingType = .none
         panel.collectionBehavior = [.canJoinAllSpaces, .transient, .ignoresCycle]
         panel.isOpaque = false
         panel.backgroundColor = .clear
@@ -41,6 +48,7 @@ final class WordHighlightOverlayController {
     /// `font` is the best available font for the word — passed in by the
     /// caller because we usually can't introspect the host app's text run.
     func show(word: String, font: NSFont?, at wordRect: NSRect) {
+        generation += 1
         // Pad the panel so the slight scale-up + upward lift don't clip.
         let horizontalPadding: CGFloat = 8
         let verticalPadding: CGFloat = 8
@@ -73,6 +81,8 @@ final class WordHighlightOverlayController {
 
     func hide() {
         guard panel.isVisible else { return }
+        generation += 1
+        let expected = generation
         NSAnimationContext.runAnimationGroup({ ctx in
             ctx.duration = 0.1
             panel.animator().alphaValue = 0
@@ -80,7 +90,8 @@ final class WordHighlightOverlayController {
             // NSAnimationContext fires the completion on the main thread,
             // but Swift 6 sees the closure as nonisolated. Hop back onto
             // MainActor before touching NSPanel.
-            Task { @MainActor in
+            Task { @MainActor [weak self] in
+                guard self?.generation == expected else { return }
                 panel.orderOut(nil)
             }
         })
