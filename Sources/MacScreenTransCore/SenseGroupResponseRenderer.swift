@@ -33,8 +33,7 @@ public struct SenseGroupDisplayResponse: Equatable, Sendable {
 public enum SenseGroupResponseRenderer {
     public static func response(for rawText: String) -> SenseGroupDisplayResponse? {
         let trimmed = stripMarkdownFence(rawText.trimmingCharacters(in: .whitespacesAndNewlines))
-        guard let data = trimmed.data(using: .utf8),
-              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+        guard let object = jsonObject(from: trimmed) ?? embeddedJSONObject(in: trimmed) else {
             return nil
         }
 
@@ -163,6 +162,59 @@ public enum SenseGroupResponseRenderer {
             trimmed.contains("\"translation\"") ||
             trimmed.contains("\"word_pos\"") ||
             trimmed.contains("\"word_brief\"")
+    }
+
+    private static func jsonObject(from text: String) -> [String: Any]? {
+        guard let data = text.data(using: .utf8) else { return nil }
+        return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+    }
+
+    /// Whole-string parsing failed; models sometimes wrap the JSON object in
+    /// prose ("Here is the JSON: {...}. Hope this helps."). Scan for balanced
+    /// top-level `{...}` runs — respecting string literals and escapes — and
+    /// return the first one that parses as a JSON object.
+    private static func embeddedJSONObject(in text: String) -> [String: Any]? {
+        var searchStart = text.startIndex
+        while let start = text[searchStart...].firstIndex(of: "{") {
+            if let end = balancedObjectEnd(in: text, from: start),
+               let object = jsonObject(from: String(text[start...end])) {
+                return object
+            }
+            searchStart = text.index(after: start)
+        }
+        return nil
+    }
+
+    /// Index of the `}` matching the `{` at `start`, or nil when the run
+    /// never closes (e.g. a still-streaming partial object).
+    private static func balancedObjectEnd(in text: String, from start: String.Index) -> String.Index? {
+        var depth = 0
+        var inString = false
+        var escaped = false
+        var index = start
+        while index < text.endIndex {
+            let character = text[index]
+            if escaped {
+                escaped = false
+            } else if inString {
+                if character == "\\" {
+                    escaped = true
+                } else if character == "\"" {
+                    inString = false
+                }
+            } else {
+                switch character {
+                case "\"": inString = true
+                case "{": depth += 1
+                case "}":
+                    depth -= 1
+                    if depth == 0 { return index }
+                default: break
+                }
+            }
+            index = text.index(after: index)
+        }
+        return nil
     }
 
     private static func firstString(in object: [String: Any], keys: [String]) -> String {
