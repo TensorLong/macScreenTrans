@@ -31,9 +31,11 @@ final class FloatingTranslationWindowController {
     private let bubbleBackground: BubbleBackgroundView
     private var dismissArmedAt = Date.distantPast
     private var onCloseHandler: (() -> Void)?
+    private var onScrollAwayHandler: (() -> Void)?
     nonisolated(unsafe) private var localDismissMonitor: Any?
     nonisolated(unsafe) private var globalKeyMonitor: Any?
     nonisolated(unsafe) private var globalMouseMonitor: Any?
+    nonisolated(unsafe) private var globalScrollMonitor: Any?
 
     /// Frozen at `show(anchoredTo:)`. The edge of the panel adjacent to the
     /// word is pinned at `pinnedScreenY` in screen coordinates; subsequent
@@ -189,6 +191,24 @@ final class FloatingTranslationWindowController {
     /// yellow word highlight in lockstep with the translation popup.
     func setOnClose(_ handler: @escaping () -> Void) {
         onCloseHandler = handler
+    }
+
+    /// Hook invoked when the user scrolls outside the panel while it is
+    /// visible. Scrolling moves the host content the highlight overlays are
+    /// glued to, so AppDelegate hides them — but the popup itself survives:
+    /// the user may be scrolling elsewhere to cross-reference. Scrolls
+    /// INSIDE the panel are the user reading the translation and don't fire.
+    func setOnScrollAway(_ handler: @escaping () -> Void) {
+        onScrollAwayHandler = handler
+    }
+
+    /// Self-test seams. The scroll-away path is NSEvent-monitor plumbing
+    /// that can't be driven synthetically without the Accessibility grant,
+    /// so the harness calls the shared handler directly.
+    var panelFrame: NSRect { panel.frame }
+    var isPanelVisible: Bool { panel.isVisible }
+    func simulateScroll(at location: NSPoint) {
+        notifyScrollAway(at: location)
     }
 
     func show(at point: CGPoint, text: String) {
@@ -478,11 +498,19 @@ final class FloatingTranslationWindowController {
 
     private func installDismissMonitors() {
         localDismissMonitor = NSEvent.addLocalMonitorForEvents(
-            matching: [.keyDown, .leftMouseDown, .rightMouseDown, .otherMouseDown]
+            matching: [.keyDown, .leftMouseDown, .rightMouseDown, .otherMouseDown, .scrollWheel]
         ) { [weak self] event in
             if event.type == .keyDown, event.keyCode == 53 {
                 self?.close()
                 return nil
+            }
+            if event.type == .scrollWheel {
+                // Phase-only events (gesture began/ended, momentum start)
+                // carry zero deltas and move nothing — ignore them.
+                if abs(event.scrollingDeltaX) + abs(event.scrollingDeltaY) > 0 {
+                    self?.notifyScrollAway(at: NSEvent.mouseLocation)
+                }
+                return event
             }
             if event.type == .leftMouseDown || event.type == .rightMouseDown || event.type == .otherMouseDown {
                 self?.closeIfClickIsOutsidePanel()
@@ -501,12 +529,23 @@ final class FloatingTranslationWindowController {
         ) { [weak self] _ in
             Task { @MainActor in self?.closeIfClickIsOutsidePanel() }
         }
+
+        globalScrollMonitor = NSEvent.addGlobalMonitorForEvents(matching: .scrollWheel) { [weak self] event in
+            guard abs(event.scrollingDeltaX) + abs(event.scrollingDeltaY) > 0 else { return }
+            let location = NSEvent.mouseLocation
+            Task { @MainActor in self?.notifyScrollAway(at: location) }
+        }
     }
 
     private func closeIfClickIsOutsidePanel() {
         guard Date() >= dismissArmedAt else { return }
         guard panel.isVisible, !panel.frame.contains(NSEvent.mouseLocation) else { return }
         close()
+    }
+
+    private func notifyScrollAway(at location: NSPoint) {
+        guard panel.isVisible, !panel.frame.contains(location) else { return }
+        onScrollAwayHandler?()
     }
 
     deinit {
@@ -518,6 +557,9 @@ final class FloatingTranslationWindowController {
         }
         if let globalMouseMonitor {
             NSEvent.removeMonitor(globalMouseMonitor)
+        }
+        if let globalScrollMonitor {
+            NSEvent.removeMonitor(globalScrollMonitor)
         }
     }
 }

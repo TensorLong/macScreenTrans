@@ -20,6 +20,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// dropped instead of queueing (a queued tap would re-read the cursor
     /// position later and OCR wherever it drifted to).
     private var resolveInFlight = false
+    /// Set when the user scrolls while the popup is up: the content under
+    /// the highlights moved, so this tap's OCR geometry is stale. The
+    /// overlays are hidden immediately and must not reappear for this
+    /// generation (the still-streaming task would otherwise paint the green
+    /// phrase at the old coordinates when the LLM answers). The popup itself
+    /// survives — the user may be scrolling elsewhere to cross-reference.
+    private var scrolledSinceTap = false
     private lazy var popup: FloatingTranslationWindowController = {
         let controller = FloatingTranslationWindowController()
         controller.setOnClose { [weak self] in
@@ -30,6 +37,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.tapGeneration += 1
             self.streamingTask?.cancel()
             self.streamingTask = nil
+            self.highlightOverlay.hide()
+            self.phraseOverlay.hide()
+        }
+        controller.setOnScrollAway { [weak self] in
+            guard let self else { return }
+            self.scrolledSinceTap = true
             self.highlightOverlay.hide()
             self.phraseOverlay.hide()
         }
@@ -201,6 +214,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         tapGeneration += 1
         let generation = tapGeneration
+        scrolledSinceTap = false
         streamingTask?.cancel()
         streamingTask = nil
         highlightOverlay.hide()
@@ -252,7 +266,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Re-anchor the popup to the recognized word's screen rect when OCR
         // gives us bounds. Otherwise it stays at the cursor — this still
         // happens for image PDFs / custom UIs that don't report bounds.
-        if let wordRect = result.wordRect {
+        // A scroll during the resolve means the word is no longer at that
+        // rect: skip both the highlight and the re-anchor (the popup stays
+        // at the cursor, which is still where the user is looking).
+        if let wordRect = result.wordRect, !scrolledSinceTap {
             highlightOverlay.show(at: wordRect)
             popup.show(anchoredTo: wordRect, text: "取词中...")
         }
@@ -298,7 +315,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     // Per-line segments come from OCRWordReader.phraseSegments.
                     // The overlay is a translucent tint over the real glyphs,
                     // so no font is needed — the box size is all that matters.
-                    if !response.source.isEmpty {
+                    if !response.source.isEmpty, !self.scrolledSinceTap {
                         let phrase = response.source
                         let segs = lookupBox.result.phraseSegments(for: phrase, positionString: positionString)
                         if !segs.isEmpty {

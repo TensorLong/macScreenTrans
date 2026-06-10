@@ -155,6 +155,12 @@ private final class SelfTestDelegate: NSObject, NSApplicationDelegate {
             let cursorFailures = await self.runCursorOcclusionCheck()
             wordFailures += cursorFailures
 
+            // Field requirement: scrolling moves the content the highlights
+            // are glued to — they must vanish — but the popup must survive
+            // so the user can scroll elsewhere to cross-reference.
+            let scrollFailures = await self.runScrollAwayCheck()
+            wordFailures += scrollFailures
+
             if ProcessInfo.processInfo.environment["MST_CHROME_DUMP"] != nil {
                 await self.dumpPopupChrome()
             }
@@ -350,6 +356,49 @@ private final class SelfTestDelegate: NSObject, NSApplicationDelegate {
         if let primary = NSScreen.screens.first(where: { $0.frame.origin == .zero }) {
             CGWarpMouseCursorPosition(CGPoint(x: restore.x, y: primary.frame.maxY - restore.y))
         }
+        print()
+        return failures
+    }
+
+    /// Scroll-away contract: a scroll OUTSIDE the panel fires the handler
+    /// (AppDelegate hides the highlight overlays), a scroll INSIDE the panel
+    /// (the user reading the translation) does not, and the popup stays
+    /// visible either way. Posting a real scroll event needs the
+    /// Accessibility grant the app doesn't have, so this drives the shared
+    /// handler the NSEvent monitors call.
+    private func runScrollAwayCheck() async -> Int {
+        print("=== scroll-away check ===")
+        let popup = FloatingTranslationWindowController()
+        var notified = 0
+        popup.setOnScrollAway { notified += 1 }
+        popup.show(at: NSPoint(x: 400, y: 400), text: "取词中...")
+        try? await Task.sleep(nanoseconds: 300_000_000)
+
+        var failures = 0
+        let frame = popup.panelFrame
+        popup.simulateScroll(at: NSPoint(x: frame.minX - 40, y: frame.minY - 40))
+        if notified == 1 {
+            print("✓ outside-panel scroll fired scroll-away")
+        } else {
+            print("✗ outside-panel scroll: expected 1 notification, got \(notified)")
+            failures += 1
+        }
+
+        popup.simulateScroll(at: NSPoint(x: frame.midX, y: frame.midY))
+        if notified == 1 {
+            print("✓ inside-panel scroll ignored")
+        } else {
+            print("✗ inside-panel scroll fired scroll-away (notified=\(notified))")
+            failures += 1
+        }
+
+        if popup.isPanelVisible {
+            print("✓ popup still visible after scroll-away")
+        } else {
+            print("✗ popup vanished on scroll")
+            failures += 1
+        }
+        popup.close()
         print()
         return failures
     }
