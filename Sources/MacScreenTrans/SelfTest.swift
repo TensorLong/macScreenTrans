@@ -146,6 +146,13 @@ private final class SelfTestDelegate: NSObject, NSApplicationDelegate {
             let pollutionFailures = await self.runPopupPollutionCheck()
             wordFailures += pollutionFailures
 
+            // Field report: with the pointer parked on the tapped word (the
+            // pointing-hand hover state over links), recognition garbles into
+            // frankenwords. Reproduce: warp the hardware cursor onto a probe
+            // word, force the pointing-hand shape, and resolve.
+            let cursorFailures = await self.runCursorOcclusionCheck()
+            wordFailures += cursorFailures
+
             print("=== Self-test summary ===")
             print("resolve failures: \(resolveFailures)")
             print("word failures: \(wordFailures)")
@@ -301,6 +308,42 @@ private final class SelfTestDelegate: NSObject, NSApplicationDelegate {
             failures += 1
         }
         popup.close()
+        print()
+        return failures
+    }
+
+    /// Park the hardware cursor exactly on a probe word — the field-reported
+    /// "pointing hand over a link" state — and resolve at that point. If the
+    /// capture path ever composites the cursor into the strip, the cursor
+    /// pixels garble the word under it and this probe fails.
+    private func runCursorOcclusionCheck() async -> Int {
+        guard window != nil else { return 0 }
+        print("=== cursor occlusion check ===")
+        guard let aim = screenRect(forSubstring: "brownjack") else { return 0 }
+        let pt = NSPoint(x: aim.midX, y: aim.midY)
+
+        let restore = NSEvent.mouseLocation
+        if let primary = NSScreen.screens.first(where: { $0.frame.origin == .zero }) {
+            let quartz = CGPoint(x: pt.x, y: primary.frame.maxY - pt.y)
+            CGWarpMouseCursorPosition(quartz)
+        }
+        NSCursor.pointingHand.set()
+        try? await Task.sleep(nanoseconds: 600_000_000)
+
+        var failures = 0
+        if let result = await OCRWordReader.resolve(at: pt) {
+            let ok = result.selection.word.lowercased() == "brownjack"
+            print("\(ok ? "✓" : "✗") word=\"\(result.selection.word)\" with cursor parked on the word")
+            if !ok { failures += 1 }
+        } else {
+            print("✗ resolve returned nil with cursor parked on the word")
+            failures += 1
+        }
+
+        NSCursor.arrow.set()
+        if let primary = NSScreen.screens.first(where: { $0.frame.origin == .zero }) {
+            CGWarpMouseCursorPosition(CGPoint(x: restore.x, y: primary.frame.maxY - restore.y))
+        }
         print()
         return failures
     }

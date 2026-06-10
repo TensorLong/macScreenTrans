@@ -135,10 +135,21 @@ struct LegacyWindowListCapture: ScreenRegionCapturing {
             return nil
         }
 
+        let cursorLevel = Int(CGWindowLevelForKey(.cursorWindow))
         var ids: [CGWindowID] = []
         ids.reserveCapacity(info.count)
         for entry in info {
             guard let number = entry[kCGWindowNumber as String] as? CGWindowID else { continue }
+            // The hardware cursor can materialize as a real window in the
+            // on-screen list (owner "Window Server", 65×65, at
+            // kCGCursorWindowLevel). The full-composite capture API skips it,
+            // but an array composite paints it — right on the tapped word,
+            // since the pointer is where the user taps — garbling OCR (the
+            // field "pointing-hand over a link" bug). Nothing readable lives
+            // at or above cursor level, so drop those windows wholesale.
+            if let layer = entry[kCGWindowLayer as String] as? Int, layer >= cursorLevel {
+                continue
+            }
             let owner = entry[kCGWindowOwnerPID as String] as? pid_t
             // Drop our own windows (popup, overlays, settings) so they never
             // pollute the OCR strip — unless explicitly force-included (the
