@@ -115,6 +115,7 @@ public enum OCRSentenceAssembler {
 
         for idx in ordered.indices {
             let line = ordered[idx]
+            let normalizedWords = normalizeWordBoxes(line.words)
 
             // Look ahead: a trailing hyphen continued by a lowercase next line
             // is a soft-wrapped word — drop the hyphen and join with nothing.
@@ -136,7 +137,7 @@ public enum OCRSentenceAssembler {
 
             // Remap each word's range to global offsets, clipping any word
             // that ran into the dropped hyphen.
-            let remapped: [RecognizedWord] = line.words.compactMap { word in
+            let remapped: [RecognizedWord] = normalizedWords.compactMap { word in
                 let lo = min(word.range.lowerBound, effectiveLen)
                 let hi = min(word.range.upperBound, effectiveLen)
                 guard lo < hi else { return nil }
@@ -154,8 +155,62 @@ public enum OCRSentenceAssembler {
             }
         }
 
-        let (tappedRange, tappedBox) = locateTappedWord(in: assembled, tapPoint: tapPoint, medianHeight: median)
+        let (tappedRange, tappedBox) = locateTappedWord(
+            in: assembled,
+            text: text,
+            tapPoint: tapPoint,
+            medianHeight: median
+        )
         return AssembledText(text: text, lines: assembled, tappedWordRange: tappedRange, tappedWordBox: tappedBox)
+    }
+
+    /// Vision's `boundingBox(for:)` resolves the queried character range to
+    /// ITS OWN token containing it — for slash-joined paths
+    /// ("/Users/brownjack/…") or script-mixed runs, several `.byWords` tokens
+    /// map to one Vision token and every one of them comes back with the same
+    /// token-wide box. Hit-testing then can't tell those words apart and the
+    /// word highlight covers the whole token. Detect runs of consecutive words
+    /// sharing one box and slice that box horizontally in proportion to each
+    /// word's UTF-16 span within the run.
+    static func normalizeWordBoxes(_ words: [RecognizedWord]) -> [RecognizedWord] {
+        guard words.count > 1 else { return words }
+        var result: [RecognizedWord] = []
+        result.reserveCapacity(words.count)
+        var i = words.startIndex
+        while i < words.endIndex {
+            var j = i + 1
+            while j < words.endIndex, approximatelyEqual(words[j].box, words[i].box) { j += 1 }
+            let group = words[i..<j]
+            let span = group.first!.range.lowerBound..<group.last!.range.upperBound
+            let spanLength = span.upperBound - span.lowerBound
+            let box = group.first!.box
+            if group.count > 1, spanLength > 0, box.width > 0 {
+                for word in group {
+                    let relStart = CGFloat(word.range.lowerBound - span.lowerBound) / CGFloat(spanLength)
+                    let relEnd = CGFloat(word.range.upperBound - span.lowerBound) / CGFloat(spanLength)
+                    result.append(RecognizedWord(
+                        text: word.text,
+                        range: word.range,
+                        box: CGRect(
+                            x: box.minX + box.width * relStart,
+                            y: box.minY,
+                            width: box.width * (relEnd - relStart),
+                            height: box.height
+                        )
+                    ))
+                }
+            } else {
+                result.append(contentsOf: group)
+            }
+            i = j
+        }
+        return result
+    }
+
+    private static func approximatelyEqual(_ a: CGRect, _ b: CGRect) -> Bool {
+        let eps: CGFloat = 1e-4
+        return abs(a.minX - b.minX) < eps && abs(a.minY - b.minY) < eps
+            && abs(a.width - b.width) < eps && abs(a.height - b.height) < eps
     }
 
     /// Map a UTF-16 range of the assembled text to one box per visual line it
@@ -214,13 +269,14 @@ public enum OCRSentenceAssembler {
 
     private static func locateTappedWord(
         in lines: [AssembledLine],
+        text: String,
         tapPoint: CGPoint,
         medianHeight: CGFloat
     ) -> (Range<Int>?, CGRect?) {
         // Vertical tolerance so a tap just above/below the glyph body still
         // lands on the line. Falls back to a fraction of the line height when
         // no median is available.
-        let verticalPad = max(medianHeight * 0.5, 0.01)
+        let verticalPad = max(medianHeight * 0.75, 0.01)
 
         var bestLine: AssembledLine?
         var bestVerticalDistance = CGFloat.greatestFiniteMagnitude
@@ -234,30 +290,85 @@ public enum OCRSentenceAssembler {
                 bestLine = line
             }
         }
-        guard let line = bestLine, !line.words.isEmpty else { return (nil, nil) }
+        guard let line = bestLine else { return (nil, nil) }
 
-        // Word whose box contains the tap x; otherwise the nearest word within
-        // a horizontal tolerance so a tap in inter-word whitespace still
-        // resolves the intended word.
+        // No per-word geometry at all (Vision's boundingBox(for:) threw for
+        // every token on this line): synthesize the word from the line text
+        // by slicing the line box proportionally at the tap's x offset.
+        guard !line.words.isEmpty else {
+            return synthesizeWord(in: line, text: text, tapPoint: tapPoint)
+        }
+
+        // Of the words whose box contains the tap x, prefer the NARROWEST —
+        // a degenerate token-wide box must not shadow a properly-boxed word.
+        // Otherwise fall back to the nearest word within a horizontal
+        // tolerance so a tap in inter-word whitespace still resolves.
         let horizontalPad = max(line.box.height, 0.01)
-        var chosen: RecognizedWord?
-        var bestHorizontalDistance = CGFloat.greatestFiniteMagnitude
+        var containing: RecognizedWord?
+        var nearest: RecognizedWord?
+        var nearestDistance = CGFloat.greatestFiniteMagnitude
         for word in line.words {
             if tapPoint.x >= word.box.minX && tapPoint.x <= word.box.maxX {
-                chosen = word
-                bestHorizontalDistance = 0
-                break
-            }
-            let distance = tapPoint.x < word.box.minX
-                ? word.box.minX - tapPoint.x
-                : tapPoint.x - word.box.maxX
-            if distance < bestHorizontalDistance {
-                bestHorizontalDistance = distance
-                chosen = word
+                if containing == nil || word.box.width < containing!.box.width {
+                    containing = word
+                }
+            } else {
+                let distance = tapPoint.x < word.box.minX
+                    ? word.box.minX - tapPoint.x
+                    : tapPoint.x - word.box.maxX
+                if distance < nearestDistance {
+                    nearestDistance = distance
+                    nearest = word
+                }
             }
         }
-        guard let word = chosen, bestHorizontalDistance <= horizontalPad else { return (nil, nil) }
-        return (word.range, word.box)
+        if let word = containing { return (word.range, word.box) }
+        if let word = nearest, nearestDistance <= horizontalPad { return (word.range, word.box) }
+        return (nil, nil)
+    }
+
+    /// Last-resort hit-testing for a line whose words carry no geometry:
+    /// map the tap's x to a UTF-16 offset by proportion, then expand to the
+    /// whitespace-delimited token around that offset. The downstream
+    /// `WordContextExtractor` re-derives the precise linguistic word from the
+    /// offset, so an approximate token boundary is enough here.
+    private static func synthesizeWord(
+        in line: AssembledLine,
+        text: String,
+        tapPoint: CGPoint
+    ) -> (Range<Int>?, CGRect?) {
+        let span = line.range.upperBound - line.range.lowerBound
+        guard span > 0, line.box.width > 0 else { return (nil, nil) }
+
+        let rel = min(max((tapPoint.x - line.box.minX) / line.box.width, 0), 0.999)
+        var probe = line.range.lowerBound + Int(rel * CGFloat(span))
+
+        let utf16 = Array(text.utf16)
+        guard probe >= 0, probe < utf16.count else { return (nil, nil) }
+
+        func isSpace(_ unit: UInt16) -> Bool {
+            guard let scalar = Unicode.Scalar(unit) else { return false }
+            return CharacterSet.whitespacesAndNewlines.contains(scalar)
+        }
+
+        if isSpace(utf16[probe]) {
+            let left = probe - 1
+            let right = probe + 1
+            if left >= line.range.lowerBound, left >= 0, !isSpace(utf16[left]) {
+                probe = left
+            } else if right < line.range.upperBound, right < utf16.count, !isSpace(utf16[right]) {
+                probe = right
+            } else {
+                return (nil, nil)
+            }
+        }
+
+        var lo = probe
+        var hi = probe + 1
+        while lo > line.range.lowerBound, lo - 1 >= 0, !isSpace(utf16[lo - 1]) { lo -= 1 }
+        while hi < line.range.upperBound, hi < utf16.count, !isSpace(utf16[hi]) { hi += 1 }
+        let range = lo..<hi
+        return (range, proportionalSlice(of: line.box, lineRange: line.range, sub: range))
     }
 
     // MARK: - Geometry helpers

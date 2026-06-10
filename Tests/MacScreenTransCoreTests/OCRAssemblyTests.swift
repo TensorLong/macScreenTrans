@@ -112,6 +112,82 @@ private func word(_ text: String, _ range: Range<Int>, _ box: CGRect) -> Recogni
     #expect(assembled.tappedWordRange == 8..<12) // "here"
 }
 
+@Test func assemblerSubdividesVisionTokenWideWordBoxes() {
+    // Mirrors the field bug: every `.byWords` word of "/Users/brownjack/project"
+    // came back from Vision with the same token-wide box, so a tap anywhere in
+    // the path always resolved the FIRST word ("Users") and the yellow box
+    // covered the whole token. After normalization, the tap must resolve the
+    // word actually under the finger, with a proportional slice as its box.
+    let sharedBox = CGRect(x: 0.3, y: 0.10, width: 0.45, height: 0.05)
+    let line = RecognizedLine(
+        text: "open /Users/brownjack/project now",
+        box: CGRect(x: 0.0, y: 0.10, width: 0.8, height: 0.05),
+        words: [
+            word("open", 0..<4, CGRect(x: 0.00, y: 0.10, width: 0.05, height: 0.05)),
+            word("Users", 6..<11, sharedBox),
+            word("brownjack", 12..<21, sharedBox),
+            word("project", 22..<29, sharedBox),
+            word("now", 30..<33, CGRect(x: 0.76, y: 0.10, width: 0.04, height: 0.05)),
+        ]
+    )
+    // Shared run spans offsets 6..<29 over x 0.30...0.75. "project" (22..<29)
+    // slices to x ≈ 0.613...0.75; tap inside that slice.
+    let assembled = OCRSentenceAssembler.assemble(lines: [line], tapPoint: CGPoint(x: 0.70, y: 0.12))
+    #expect(assembled.tappedWordRange == 22..<29)
+    if let box = assembled.tappedWordBox {
+        #expect(box.minX > 0.55)
+        #expect(box.width < 0.2)
+    } else {
+        Issue.record("normalization produced no tapped word box")
+    }
+}
+
+@Test func normalizeWordBoxesLeavesDistinctBoxesUntouched() {
+    let words = [
+        word("alpha", 0..<5, CGRect(x: 0.00, y: 0.1, width: 0.10, height: 0.05)),
+        word("beta", 6..<10, CGRect(x: 0.12, y: 0.1, width: 0.08, height: 0.05)),
+    ]
+    #expect(OCRSentenceAssembler.normalizeWordBoxes(words) == words)
+}
+
+@Test func assemblerPrefersNarrowestContainingBoxOverFirstMatch() {
+    // One degenerate token-wide box alongside properly-boxed words: a tap
+    // inside the proper word must pick it, not the first containing box.
+    let line = RecognizedLine(
+        text: "alpha beta gamma",
+        box: CGRect(x: 0.0, y: 0.10, width: 0.6, height: 0.05),
+        words: [
+            word("alpha", 0..<5, CGRect(x: 0.0, y: 0.10, width: 0.60, height: 0.05)),
+            word("beta", 6..<10, CGRect(x: 0.25, y: 0.10, width: 0.10, height: 0.05)),
+            word("gamma", 11..<16, CGRect(x: 0.40, y: 0.10, width: 0.15, height: 0.05)),
+        ]
+    )
+    let assembled = OCRSentenceAssembler.assemble(lines: [line], tapPoint: CGPoint(x: 0.30, y: 0.12))
+    #expect(assembled.tappedWordRange == 6..<10)
+}
+
+@Test func assemblerSynthesizesWordWhenLineCarriesNoWordGeometry() {
+    // Vision sometimes throws for every boundingBox(for:) query on a line,
+    // leaving words=[] while the line box itself is fine. The tap must still
+    // resolve by proportional offset instead of failing with
+    // "no word under tap".
+    let line = RecognizedLine(
+        text: "hello wonderful world",
+        box: CGRect(x: 0.1, y: 0.10, width: 0.42, height: 0.05),
+        words: []
+    )
+    // 21 UTF-16 units over x 0.10...0.52; tap at x=0.33 → offset 11 → expands
+    // to "wonderful" (6..<15).
+    let assembled = OCRSentenceAssembler.assemble(lines: [line], tapPoint: CGPoint(x: 0.33, y: 0.12))
+    #expect(assembled.tappedWordRange == 6..<15)
+    if let box = assembled.tappedWordBox {
+        #expect(abs(box.minX - (0.1 + 0.42 * 6.0 / 21.0)) < 0.01)
+        #expect(abs(box.width - 0.42 * 9.0 / 21.0) < 0.01)
+    } else {
+        Issue.record("no synthesized box for the geometry-less line")
+    }
+}
+
 @Test func assemblerReturnsNilWhenTapMissesEveryLine() {
     let line = RecognizedLine(
         text: "hello world",
