@@ -20,8 +20,9 @@ final class SettingsWindowController {
         // the red close button would over-release the window and crash on
         // the next show(). Keep ownership purely with ARC.
         window.isReleasedWhenClosed = false
-        // Keep the settings window out of our own OCR screen captures.
-        window.sharingType = .none
+        // Kept out of our own OCR captures via window-ID exclusion (see
+        // ScreenRegionCapture), NOT sharingType — so external screenshot
+        // tools can still record this window.
         window.contentView = NSHostingView(rootView: view)
         window.center()
     }

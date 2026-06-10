@@ -253,7 +253,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // gives us bounds. Otherwise it stays at the cursor — this still
         // happens for image PDFs / custom UIs that don't report bounds.
         if let wordRect = result.wordRect {
-            highlightOverlay.show(word: selection.word, font: nil, at: wordRect)
+            highlightOverlay.show(at: wordRect)
             popup.show(anchoredTo: wordRect, text: "取词中...")
         }
 
@@ -292,46 +292,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 if output.isEmpty {
                     self.popup.update("模型没有返回内容。")
                 } else if let response = SenseGroupResponseRenderer.response(for: output) {
-                    // Reveal the green phrase overlay as soon as the LLM gives us
-                    // a usable source phrase, regardless of whether we'll later
-                    // fall through to the translation-only fallback. Per-line
-                    // segments come from OCRWordReader.phraseSegments. Derive
-                    // the phrase font from the resolved word rect (or fall
-                    // back to nil → the overlay infers from segment height)
-                    // so the redraw doesn't pick up a stale ~70pt font when
-                    // a single segment happens to be tall (Issue 1 fix).
+                    // Reveal the green phrase overlay as soon as the LLM gives
+                    // us a usable source phrase, regardless of whether we'll
+                    // later fall through to the translation-only fallback.
+                    // Per-line segments come from OCRWordReader.phraseSegments.
+                    // The overlay is a translucent tint over the real glyphs,
+                    // so no font is needed — the box size is all that matters.
                     if !response.source.isEmpty {
                         let phrase = response.source
                         let segs = lookupBox.result.phraseSegments(for: phrase, positionString: positionString)
                         if !segs.isEmpty {
-                            let phraseFont: NSFont?
-                            if let wordRect = lookupBox.result.wordRect {
-                                phraseFont = .systemFont(ofSize: max(11, wordRect.height * 0.78))
-                            } else {
-                                phraseFont = nil
-                            }
-                            self.phraseOverlay.show(segments: segs, font: phraseFont)
+                            self.phraseOverlay.show(segments: segs)
 
-                            // Option B: yellow word box was missing
-                            // because `boundsForRange` returned nil for
-                            // the word range (soft-wrap / zero-width-
-                            // space / odd web glyph — Issue 3). When
-                            // green segments DID resolve, slice the
-                            // matching segment proportionally to land
-                            // yellow on the word visually. We pass the
-                            // cursor anchor so a sentence with two of
-                            // the same word still gets yellow on the
-                            // occurrence the user pointed at.
+                            // Option B: yellow word box was missing because
+                            // the OCR word range carried no geometry (soft-
+                            // wrap / zero-width-space / odd web glyph). When
+                            // green segments DID resolve, slice the matching
+                            // segment proportionally to land yellow on the
+                            // word visually. We pass the cursor anchor so a
+                            // sentence with two of the same word still gets
+                            // yellow on the occurrence the user pointed at.
                             if lookupBox.result.wordRect == nil,
                                let derivedRect = Self.deriveWordRectFromSegments(
                                 segments: segs,
                                 clickedWordRange: lookupBox.result.clickedWordRangeInLookupText
                                ) {
-                                self.highlightOverlay.show(
-                                    word: selection.word,
-                                    font: nil,
-                                    at: derivedRect
-                                )
+                                self.highlightOverlay.show(at: derivedRect)
                             }
                         }
                     }

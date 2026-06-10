@@ -120,13 +120,26 @@ enum OCRWordReader {
         let recognizer = VisionTextRecognizer(recognitionLanguages: recognitionLanguages)
         let lines = recognizer.recognize(in: region.image)
         diag.append("ocr: \(lines.count) line(s)")
+
+        let tapNorm = OCRGeometry.normalizedTapPoint(appKitPoint, in: region.screenFrame)
+        let assembled = OCRSentenceAssembler.assemble(lines: lines, tapPoint: tapNorm)
+        // Evidence dump for field debugging — `diag` is read at scope exit so
+        // the report carries the final pipeline verdict, whichever return ran.
+        defer {
+            OCRDebugDump.dumpIfEnabled(
+                image: region.image,
+                screenFrame: region.screenFrame,
+                assembled: assembled,
+                tapNorm: tapNorm,
+                appKitTap: appKitPoint,
+                report: diag.joined(separator: "\n")
+            )
+        }
         guard !lines.isEmpty else {
             diag.append("ocr: no text recognized in strip")
             return (nil, diag.joined(separator: "\n"))
         }
 
-        let tapNorm = OCRGeometry.normalizedTapPoint(appKitPoint, in: region.screenFrame)
-        let assembled = OCRSentenceAssembler.assemble(lines: lines, tapPoint: tapNorm)
         guard let wordRange = assembled.tappedWordRange else {
             diag.append("locate: no word under tap (norm=\(Self.describe(tapNorm)))")
             return (nil, diag.joined(separator: "\n"))

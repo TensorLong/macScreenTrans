@@ -2,10 +2,22 @@ import AppKit
 import MacScreenTransCore
 
 /// Autonomous OCR self-test harness. Invoked by passing `--self-test` to the
-/// app binary. Renders a deterministic NSTextView with known text, then runs
-/// `OCRWordReader.resolve(at:)` at several screen positions inside the text and
+/// app binary. Renders deterministic NSTextViews with known text, then runs
+/// `OCRWordReader.resolve(at:)` at the screen position of known words and
 /// prints a per-probe report to stdout. Exits before the normal app delegate
 /// runs.
+///
+/// Every probe is checked against GROUND TRUTH: the layout manager knows
+/// exactly which token sits under the probe point and the screen rect of its
+/// glyphs, so the OCR-mapped rects must agree within tolerance. This is what
+/// catches geometry distortion (wrong size/position of the yellow/green
+/// highlights) that a text-only check sails past.
+///
+/// Two scenarios run back to back:
+///   - "clean": 28pt system font, black on white — the easy case.
+///   - "terminal": 13pt monospace, light on dark, with an ls(1)-style column
+///     line, a slash path (Vision returns ONE token box for all its words)
+///     and an unspaced Chinese line — the field conditions that broke v0.3.
 ///
 /// Running this from a signed .app bundle reuses the bundle's Screen Recording
 /// TCC grant, so the full capture → Vision → assemble → resolve pipeline is
@@ -13,6 +25,9 @@ import MacScreenTransCore
 enum SelfTest {
     @MainActor
     static func run() -> Never {
+        // Line-buffer stdout so a mid-run crash doesn't swallow every probe
+        // report already printed (piped stdout is block-buffered by default).
+        setvbuf(stdout, nil, _IOLBF, 0)
         let app = NSApplication.shared
         app.setActivationPolicy(.regular)
         // `run()` never returns, so this local retains the delegate (NSApp's
@@ -24,134 +39,439 @@ enum SelfTest {
     }
 }
 
+// MARK: - Scenario definitions
+
+private struct ProbeSpec {
+    /// Substring of the scenario text to aim at; the probe taps its center.
+    let target: String
+    /// `true` → the OCR word must merely be CONTAINED in the layout token
+    /// under the tap and the OCR rect must sit INSIDE the token rect (used
+    /// for unspaced CJK runs and slash paths, where the whitespace token is
+    /// much bigger than the linguistic word). `false` → exact comparison.
+    let containment: Bool
+
+    init(_ target: String, containment: Bool = false) {
+        self.target = target
+        self.containment = containment
+    }
+}
+
+private struct Scenario {
+    let name: String
+    let text: String
+    let font: NSFont
+    let textColor: NSColor
+    let backgroundColor: NSColor
+    let probes: [ProbeSpec]
+    /// Phrase passed to `phraseSegments(for:)` on the first successful probe
+    /// result; the union of segment rects must agree with the layout rect.
+    let phrase: String
+    let viewSize: NSSize
+}
+
 @MainActor
 private final class SelfTestDelegate: NSObject, NSApplicationDelegate {
     private var window: NSWindow?
     private var textView: NSTextView?
-    private static let probeText = "The quick brown fox jumps over the lazy dog right now"
+
+    private static let scenarios: [Scenario] = [
+        Scenario(
+            name: "clean",
+            text: "The quick brown fox jumps over the lazy dog right now",
+            font: .systemFont(ofSize: 28),
+            textColor: .black,
+            backgroundColor: .white,
+            probes: [
+                ProbeSpec("quick"),
+                ProbeSpec("brown"),
+                ProbeSpec("over"),
+                ProbeSpec("dog"),
+                ProbeSpec("now"),
+            ],
+            phrase: "quick brown fox",
+            viewSize: NSSize(width: 800, height: 60)
+        ),
+        Scenario(
+            name: "terminal",
+            text: """
+            drwxr-xr-x   5 brownjack  staff   160 Jun 10 17:02 release
+            swift build --package-path /Users/brownjack/project/macScreenTrans-clipboard
+            已打包release版本，全部88个测试通过，等待真机验证
+            """,
+            font: .monospacedSystemFont(ofSize: 13, weight: .regular),
+            textColor: NSColor(calibratedWhite: 0.92, alpha: 1),
+            backgroundColor: NSColor(calibratedWhite: 0.12, alpha: 1),
+            probes: [
+                ProbeSpec("brownjack"),
+                ProbeSpec("staff"),
+                ProbeSpec("160"),
+                ProbeSpec("macScreenTrans-clipboard", containment: true),
+                ProbeSpec("测试", containment: true),
+            ],
+            phrase: "全部88个测试通过",
+            viewSize: NSSize(width: 860, height: 90)
+        ),
+    ]
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        let textView = NSTextView(frame: NSRect(x: 0, y: 0, width: 720, height: 60))
-        textView.string = Self.probeText
-        textView.isEditable = false
-        textView.isSelectable = true
-        textView.isVerticallyResizable = false
-        textView.isHorizontallyResizable = false
-        textView.font = NSFont.systemFont(ofSize: 28)
-        textView.drawsBackground = true
-        textView.backgroundColor = .white
-        textView.textColor = .black
-        textView.textContainerInset = NSSize(width: 8, height: 8)
-        self.textView = textView
-
-        let window = NSWindow(
-            contentRect: NSRect(x: 300, y: 400, width: 760, height: 120),
-            styleMask: [.titled],
-            backing: .buffered,
-            defer: false
+        // Route the per-tap evidence dump somewhere inspectable.
+        OCRDebugDump.overrideDirectory = URL(
+            fileURLWithPath: "/tmp/mst-selftest-dump",
+            isDirectory: true
         )
-        window.title = "MacScreenTrans Self-Test"
-        textView.frame = NSRect(x: 20, y: 30, width: 720, height: 60)
-        window.contentView?.addSubview(textView)
-        window.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
-        self.window = window
 
-        // Give WindowServer time to composite the window before screenshotting.
         Task { @MainActor [weak self] in
-            try? await Task.sleep(nanoseconds: 1_200_000_000)
-            await self?.runProbes()
+            guard let self else { exit(1) }
+            var geometryFailures = 0
+            var wordFailures = 0
+            var resolveFailures = 0
+            var phraseFailures = 0
+
+            print("[SelfTest] screenRecordingGranted=\(PermissionHelper.screenRecordingGranted)")
+            print("[SelfTest] evidence dump: /tmp/mst-selftest-dump")
+            print()
+
+            for scenario in Self.scenarios {
+                let outcome = await self.run(scenario)
+                geometryFailures += outcome.geometryFailures
+                wordFailures += outcome.wordFailures
+                resolveFailures += outcome.resolveFailures
+                phraseFailures += outcome.phraseFailures
+            }
+
+            // The field tap path shows the "取词中..." popup BEFORE the strip
+            // is captured. Verify live that our own windows really are
+            // excluded from our own capture — if they aren't, the popup's
+            // text pollutes every subsequent OCR context.
+            let pollutionFailures = await self.runPopupPollutionCheck()
+            wordFailures += pollutionFailures
+
+            print("=== Self-test summary ===")
+            print("resolve failures: \(resolveFailures)")
+            print("word failures: \(wordFailures)")
+            print("geometry failures: \(geometryFailures)")
+            print("phrase failures: \(phraseFailures)")
+            if resolveFailures == 0 && wordFailures == 0 && geometryFailures == 0 && phraseFailures == 0 {
+                print("VERDICT: PASS — OCR word, phrase and geometry probes succeeded in all scenarios")
+            } else if !PermissionHelper.screenRecordingGranted {
+                print("VERDICT: BLOCKED — Screen Recording not granted; capture returned no text")
+            } else if resolveFailures == 0 && wordFailures == 0 {
+                print("VERDICT: PARTIAL-geometry — words resolved but rects disagree with the layout ground truth")
+            } else {
+                print("VERDICT: FAIL — see per-probe output above")
+            }
             exit(0)
         }
     }
 
-    private func runProbes() async {
-        guard let window, let textView else {
-            print("[SelfTest] FAIL: window/textView missing")
-            return
+    private struct ScenarioOutcome {
+        var resolveFailures = 0
+        var wordFailures = 0
+        var geometryFailures = 0
+        var phraseFailures = 0
+    }
+
+    private func run(_ scenario: Scenario) async -> ScenarioOutcome {
+        var outcome = ScenarioOutcome()
+        print("=== scenario[\(scenario.name)] ===")
+
+        presentWindow(for: scenario)
+        // Give WindowServer time to composite the window before screenshotting.
+        try? await Task.sleep(nanoseconds: 1_200_000_000)
+
+        guard textView != nil, window != nil else {
+            print("✗ window/textView missing")
+            outcome.resolveFailures += scenario.probes.count
+            return outcome
         }
+        print("text=\(scenario.text.split(separator: "\n").map { "\"\($0)\"" }.joined(separator: " / "))")
 
-        let textInWindow = textView.convert(textView.bounds, to: nil)
-        let textOnScreen = window.convertToScreen(textInWindow)
+        var firstResult: OCRWordReader.Result?
+        for probe in scenario.probes {
+            guard let aim = screenRect(forSubstring: probe.target) else {
+                print("--- probe[\(probe.target)] — target not found in layout, skipped")
+                continue
+            }
+            let pt = NSPoint(x: aim.midX, y: aim.midY)
+            print("--- probe[\(probe.target)] AppKit=(\(Int(pt.x)),\(Int(pt.y))) ---")
 
-        print("[SelfTest] screenRecordingGranted=\(PermissionHelper.screenRecordingGranted)")
-        print("[SelfTest] textView onScreen=\(textOnScreen)")
-        print("[SelfTest] text=\"\(Self.probeText)\" len=\(Self.probeText.count)")
-        print()
+            guard let truth = groundTruth(at: pt) else {
+                print("  (no layout ground truth — skipped)")
+                continue
+            }
+            print("  expect token=\"\(truth.word)\" rect=\(Self.describe(truth.rect))")
 
-        let positions: [(name: String, point: NSPoint)] = [
-            ("left",    NSPoint(x: textOnScreen.minX + 80,                        y: textOnScreen.midY)),
-            ("quarter", NSPoint(x: textOnScreen.minX + textOnScreen.width * 0.30, y: textOnScreen.midY)),
-            ("middle",  NSPoint(x: textOnScreen.midX,                             y: textOnScreen.midY)),
-            ("three-q", NSPoint(x: textOnScreen.minX + textOnScreen.width * 0.70, y: textOnScreen.midY)),
-            ("right",   NSPoint(x: textOnScreen.maxX - 80,                        y: textOnScreen.midY)),
-        ]
-
-        var passed = 0
-        var failed = 0
-        var distinctWords = Set<String>()
-        var middleResult: OCRWordReader.Result?
-
-        for (name, pt) in positions {
-            print("--- probe[\(name)] AppKit=(\(Int(pt.x)),\(Int(pt.y))) ---")
-            if let result = await OCRWordReader.resolve(at: pt) {
-                print("✓ word=\"\(result.selection.word)\"")
-                if let rect = result.wordRect {
-                    print("  wordRect=(\(Int(rect.minX)),\(Int(rect.minY))) \(Int(rect.width))×\(Int(rect.height))")
-                } else {
-                    print("  wordRect=nil")
-                }
-                passed += 1
-                distinctWords.insert(result.selection.word)
-                if name == "middle" { middleResult = result }
-            } else {
+            guard let result = await OCRWordReader.resolve(at: pt) else {
                 print("✗ resolve returned nil")
-                failed += 1
+                for line in OCRWordReader.lastDiagnostic.split(separator: "\n") {
+                    print("  | \(line)")
+                }
+                outcome.resolveFailures += 1
+                continue
             }
-            for line in OCRWordReader.lastDiagnostic.split(separator: "\n") {
-                print("  | \(line)")
+
+            let got = result.selection.word
+            let wordOK: Bool
+            if probe.containment {
+                wordOK = truth.word.lowercased().contains(got.lowercased())
+            } else {
+                wordOK = got.lowercased() == truth.word.lowercased()
             }
-            print()
+            print("\(wordOK ? "✓" : "✗") word=\"\(got)\"")
+            if !wordOK { outcome.wordFailures += 1 }
+
+            if let rect = result.wordRect {
+                print("  wordRect=\(Self.describe(rect))")
+                let check = probe.containment
+                    ? Self.containmentCheck(ocr: rect, container: truth.rect)
+                    : Self.compareRects(ocr: rect, expected: truth.rect)
+                print("  geometry \(check.pass ? "✓" : "✗") \(check.detail)")
+                if !check.pass { outcome.geometryFailures += 1 }
+            } else {
+                print("  wordRect=nil")
+                outcome.geometryFailures += 1
+            }
+            if firstResult == nil { firstResult = result }
         }
 
-        // Phrase-rect probe: ask for a 3-word substring of the probe text and
-        // confirm at least one segment's text contains the leading word.
-        let phrase = "quick brown fox"
-        let leadingWord = "quick"
-        var phraseSegments: [PhraseSegment] = []
-        var phraseOK = false
-        print("--- phrase[\"\(phrase)\"] using middle probe ---")
-        if let result = middleResult {
-            phraseSegments = result.phraseSegments(for: phrase)
-            if phraseSegments.isEmpty {
+        // Phrase probe: locate the scenario phrase from the first result and
+        // compare the union of segment rects against the layout rect.
+        print("--- phrase[\"\(scenario.phrase)\"] ---")
+        if let result = firstResult {
+            let segments = result.phraseSegments(for: scenario.phrase)
+            if segments.isEmpty {
                 print("✗ no segments returned")
+                outcome.phraseFailures += 1
             } else {
-                for (idx, seg) in phraseSegments.enumerated() {
-                    print("  seg[\(idx)] rect=(\(Int(seg.rect.minX)),\(Int(seg.rect.minY))) \(Int(seg.rect.width))×\(Int(seg.rect.height)) text=\"\(seg.text)\"")
+                for (idx, seg) in segments.enumerated() {
+                    print("  seg[\(idx)] rect=\(Self.describe(seg.rect)) text=\"\(seg.text)\"")
                 }
-                phraseOK = phraseSegments.contains { $0.text.lowercased().contains(leadingWord) }
-                print(phraseOK ? "✓ a segment contains \"\(leadingWord)\"" : "✗ no segment contained \"\(leadingWord)\"")
+                if let expected = screenRect(forSubstring: scenario.phrase) {
+                    var union = segments[0].rect
+                    for seg in segments.dropFirst() { union = union.union(seg.rect) }
+                    print("  expect rect=\(Self.describe(expected))")
+                    let check = Self.compareRects(ocr: union, expected: expected)
+                    print("  geometry \(check.pass ? "✓" : "✗") \(check.detail)")
+                    if !check.pass { outcome.phraseFailures += 1 }
+                } else {
+                    print("  (phrase not found in layout — union check skipped)")
+                }
             }
         } else {
-            print("✗ middle probe didn't produce a Result")
+            print("✗ no probe produced a Result to anchor the phrase")
+            outcome.phraseFailures += 1
         }
         print()
+        return outcome
+    }
 
-        print("=== Self-test summary ===")
-        print("passed: \(passed)  failed: \(failed)")
-        print("distinct words: \(distinctWords.count) — \(distinctWords.sorted().joined(separator: ", "))")
-        print("phrase segments: \(phraseSegments.count) phrase OK: \(phraseOK)")
-        let wordProbesPass = (failed == 0 && distinctWords.count >= 3)
-        if wordProbesPass && phraseOK {
-            print("VERDICT: PASS — OCR word + phrase probes succeeded")
-        } else if !PermissionHelper.screenRecordingGranted {
-            print("VERDICT: BLOCKED — Screen Recording not granted; capture returned no text")
-        } else if wordProbesPass && !phraseOK {
-            print("VERDICT: PARTIAL-phrase — words resolved but phrase segments failed")
-        } else if failed == positions.count {
-            print("VERDICT: FAIL — every position rejected (OCR found no word under tap)")
+    /// Re-run one probe of the LAST presented scenario with the real
+    /// translation popup showing next to the tap — exactly what the field tap
+    /// handler does. The resolved context must not contain any popup string.
+    private func runPopupPollutionCheck() async -> Int {
+        guard textView != nil, window != nil else { return 0 }
+        print("=== popup pollution check ===")
+        // Aim at a real word of the last scenario so resolve() actually lands
+        // on text; an off-text tap would falsely look like a "leak".
+        guard let aim = screenRect(forSubstring: "测试") else { return 0 }
+        let pt = NSPoint(x: aim.midX, y: aim.midY)
+
+        let popup = FloatingTranslationWindowController()
+        popup.show(at: pt, text: "取词中...")
+        // Let WindowServer composite the popup before capturing.
+        try? await Task.sleep(nanoseconds: 600_000_000)
+
+        var failures = 0
+        if let result = await OCRWordReader.resolve(at: pt) {
+            let context = result.selection.context
+            // Only strings the popup actually displays. "MacScreenTrans" is
+            // deliberately NOT a marker: the terminal scenario's own path text
+            // contains "macScreenTrans-clipboard", which OCR can capitalize.
+            let markers = ["取词中", "翻译完成", "已复制"]
+            let leaked = markers.filter { context.contains($0) }
+            if leaked.isEmpty {
+                print("✓ popup text did not leak into the OCR context")
+            } else {
+                failures += 1
+                print("✗ POPUP LEAKED INTO CAPTURE: found \(leaked.joined(separator: ", "))")
+                print("  context=\"\(context.prefix(160))\"")
+            }
         } else {
-            print("VERDICT: PARTIAL — see diagnostics above")
+            print("  (resolve returned nil with popup showing — counted as leak)")
+            failures += 1
         }
+        popup.close()
+        print()
+        return failures
+    }
+
+    // MARK: - Window plumbing
+
+    private func presentWindow(for scenario: Scenario) {
+        window?.orderOut(nil)
+        window?.close()
+
+        let textView = NSTextView(
+            frame: NSRect(origin: .zero, size: scenario.viewSize)
+        )
+        textView.string = scenario.text
+        textView.isEditable = false
+        textView.isSelectable = true
+        textView.isVerticallyResizable = false
+        textView.isHorizontallyResizable = false
+        textView.font = scenario.font
+        textView.drawsBackground = true
+        textView.backgroundColor = scenario.backgroundColor
+        textView.textColor = scenario.textColor
+        textView.textContainerInset = NSSize(width: 8, height: 8)
+        self.textView = textView
+
+        // The probe window must fill the screen's visibleFrame: the capture
+        // strip is 960×260pt centred on the tap, and anything the strip sees
+        // beyond our window is whatever the developer happens to have on
+        // screen — which pollutes the OCR context and makes probes fail for
+        // reasons unrelated to the pipeline. A full-screen opaque backdrop
+        // (strips are clamped to visibleFrame, so the menu bar and Dock are
+        // already out of reach) guarantees the strip only ever sees scenario
+        // pixels. Borderless: a title bar would put the literal app name
+        // inside the captured strip.
+        let backdrop = NSScreen.main?.visibleFrame
+            ?? NSRect(x: 0, y: 0, width: 1440, height: 800)
+        let window = NSWindow(
+            contentRect: backdrop,
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        // We keep a strong reference across scenarios — close() must not
+        // also release the window (default NSWindow behavior) or swapping
+        // scenarios over-releases and segfaults.
+        window.isReleasedWhenClosed = false
+        window.backgroundColor = scenario.backgroundColor
+        window.isOpaque = true
+        window.level = .normal
+        textView.frame = NSRect(
+            x: ((backdrop.width - scenario.viewSize.width) / 2).rounded(),
+            y: ((backdrop.height - scenario.viewSize.height) / 2).rounded(),
+            width: scenario.viewSize.width,
+            height: scenario.viewSize.height
+        )
+        window.contentView?.addSubview(textView)
+        // Borderless windows can't become key; visibility is all OCR needs.
+        window.orderFrontRegardless()
+        NSApp.activate(ignoringOtherApps: true)
+        self.window = window
+
+        // The capture pipeline excludes our own process's windows; the probe
+        // text lives in one, so force-include exactly this window. The popup
+        // created by the pollution check is NOT in this set, so that check
+        // still proves the exclusion works.
+        LegacyWindowListCapture.additionalIncludedWindowIDs = [CGWindowID(window.windowNumber)]
+    }
+
+    // MARK: - Layout ground truth
+
+    /// The token under `screenPoint` according to the TEXT LAYOUT (not OCR):
+    /// hit-test the layout manager for the character index, expand to the
+    /// whitespace-delimited token, and return it with its glyph screen rect.
+    private func groundTruth(at screenPoint: NSPoint) -> (word: String, rect: NSRect)? {
+        guard let window, let textView,
+              let layoutManager = textView.layoutManager,
+              let container = textView.textContainer else {
+            return nil
+        }
+        let windowPoint = window.convertPoint(fromScreen: screenPoint)
+        let viewPoint = textView.convert(windowPoint, from: nil)
+        let containerPoint = NSPoint(
+            x: viewPoint.x - textView.textContainerOrigin.x,
+            y: viewPoint.y - textView.textContainerOrigin.y
+        )
+        let charIndex = layoutManager.characterIndex(
+            for: containerPoint,
+            in: container,
+            fractionOfDistanceBetweenInsertionPoints: nil
+        )
+        let text = textView.string as NSString
+        guard charIndex < text.length else { return nil }
+
+        func isSpace(_ index: Int) -> Bool {
+            guard let scalar = Unicode.Scalar(text.character(at: index)) else { return false }
+            return CharacterSet.whitespacesAndNewlines.contains(scalar)
+        }
+        guard !isSpace(charIndex) else { return nil }
+
+        var lo = charIndex
+        var hi = charIndex
+        while lo > 0, !isSpace(lo - 1) { lo -= 1 }
+        while hi + 1 < text.length, !isSpace(hi + 1) { hi += 1 }
+        let range = NSRange(location: lo, length: hi - lo + 1)
+        guard let rect = screenRect(forCharacterRange: range) else { return nil }
+        return (text.substring(with: range), rect)
+    }
+
+    private func screenRect(forSubstring substring: String) -> NSRect? {
+        guard let textView else { return nil }
+        let range = (textView.string as NSString).range(of: substring)
+        guard range.location != NSNotFound else { return nil }
+        return screenRect(forCharacterRange: range)
+    }
+
+    private func screenRect(forCharacterRange range: NSRange) -> NSRect? {
+        guard let window, let textView,
+              let layoutManager = textView.layoutManager,
+              let container = textView.textContainer else {
+            return nil
+        }
+        let glyphRange = layoutManager.glyphRange(forCharacterRange: range, actualCharacterRange: nil)
+        var rect = layoutManager.boundingRect(forGlyphRange: glyphRange, in: container)
+        rect.origin.x += textView.textContainerOrigin.x
+        rect.origin.y += textView.textContainerOrigin.y
+        let inWindow = textView.convert(rect, to: nil)
+        return window.convertToScreen(inWindow)
+    }
+
+    // MARK: - Comparison
+
+    private struct RectCheck {
+        let pass: Bool
+        let detail: String
+    }
+
+    /// Layout rects span the full line height plus side bearings; OCR boxes
+    /// hug the inked glyphs. So: centers must agree tightly, sizes loosely.
+    private static func compareRects(ocr: NSRect, expected: NSRect) -> RectCheck {
+        let dx = ocr.midX - expected.midX
+        let dy = ocr.midY - expected.midY
+        let widthRatio = expected.width > 0 ? ocr.width / expected.width : 0
+        let heightRatio = expected.height > 0 ? ocr.height / expected.height : 0
+        let pass = abs(dx) <= max(6, expected.width * 0.35)
+            && abs(dy) <= max(6, expected.height * 0.6)
+            && widthRatio >= 0.45 && widthRatio <= 1.6
+            && heightRatio >= 0.35 && heightRatio <= 1.4
+        let detail = String(
+            format: "Δcenter=(%.1f,%.1f) got %.0f×%.0f, expected %.0f×%.0f (ratio %.2f/%.2f)",
+            dx, dy, ocr.width, ocr.height, expected.width, expected.height, widthRatio, heightRatio
+        )
+        return RectCheck(pass: pass, detail: detail)
+    }
+
+    /// For probes whose layout token is much bigger than the linguistic word
+    /// (slash paths, unspaced CJK): the OCR rect must sit inside the token
+    /// rect (small pad) and have a sane height; width is not comparable.
+    private static func containmentCheck(ocr: NSRect, container: NSRect) -> RectCheck {
+        let padded = container.insetBy(dx: -6, dy: -6)
+        let heightRatio = container.height > 0 ? ocr.height / container.height : 0
+        let pass = padded.contains(NSPoint(x: ocr.midX, y: ocr.midY))
+            && ocr.width <= container.width * 1.3
+            && heightRatio >= 0.35 && heightRatio <= 1.4
+        let detail = String(
+            format: "center=(%.0f,%.0f) inside token=%@ height ratio %.2f",
+            ocr.midX, ocr.midY, padded.contains(NSPoint(x: ocr.midX, y: ocr.midY)) ? "yes" : "NO", heightRatio
+        )
+        return RectCheck(pass: pass, detail: detail)
+    }
+
+    private static func describe(_ rect: NSRect) -> String {
+        "(\(Int(rect.minX)),\(Int(rect.minY)) \(Int(rect.width))×\(Int(rect.height)))"
     }
 }

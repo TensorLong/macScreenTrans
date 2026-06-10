@@ -52,6 +52,13 @@ struct LegacyWindowListCapture: ScreenRegionCapturing {
     /// shrinks the Vision workload per tap.
     static let stripHalfWidth: CGFloat = 480
 
+    /// Window IDs that belong to THIS process but should still be captured —
+    /// the self-test renders its probe text in our own window, which the
+    /// own-app exclusion would otherwise drop. Empty in production (every
+    /// window we own is UI to keep out of the strip). Read on the capture
+    /// thread; written once before probes run.
+    nonisolated(unsafe) static var additionalIncludedWindowIDs: Set<CGWindowID> = []
+
     @MainActor
     func plan(around appKitPoint: CGPoint, stripHeight: CGFloat) -> CaptureStripPlan? {
         guard let screen = Self.screen(containing: appKitPoint),
@@ -87,14 +94,69 @@ struct LegacyWindowListCapture: ScreenRegionCapturing {
     }
 
     func capture(_ plan: CaptureStripPlan) -> CapturedRegion? {
-        guard let image = CGWindowListCreateImage(
-            plan.quartz,
-            .optionOnScreenOnly,
-            kCGNullWindowID,
-            [.bestResolution, .boundsIgnoreFraming]
-        ) else { return nil }
-
+        // Exclude OUR OWN windows (the "取词中…" popup, the yellow/green
+        // overlays, settings) from the capture by window ID rather than by
+        // `NSWindow.sharingType = .none`. sharingType would also hide them
+        // from EXTERNAL screenshot tools, which makes the popup impossible to
+        // screenshot for debugging; window-ID exclusion keeps our UI visible
+        // to other apps while still keeping it out of our own OCR strip.
+        let image: CGImage?
+        if let included = Self.windowIDsExcludingOwnApp() {
+            image = CGImage(
+                windowListFromArrayScreenBounds: plan.quartz,
+                windowArray: included,
+                imageOption: [.bestResolution, .boundsIgnoreFraming]
+            )
+        } else {
+            // No other windows on screen (or the list was unavailable): fall
+            // back to a full capture so we never return an empty image.
+            image = CGWindowListCreateImage(
+                plan.quartz,
+                .optionOnScreenOnly,
+                kCGNullWindowID,
+                [.bestResolution, .boundsIgnoreFraming]
+            )
+        }
+        guard let image else { return nil }
         return CapturedRegion(image: image, screenFrame: plan.stripAppKit)
+    }
+
+    /// On-screen window IDs that do NOT belong to this process, front-to-back,
+    /// as a `CFArray` of raw window-ID pointer values — the form
+    /// `CGWindowListCreateImageFromArray` expects. Returns nil when there are
+    /// no foreign windows to image (so the caller can fall back), keeping our
+    /// own popup/overlays out of the OCR strip without `sharingType`.
+    private static func windowIDsExcludingOwnApp() -> CFArray? {
+        let ownPID = ProcessInfo.processInfo.processIdentifier
+        guard let info = CGWindowListCopyWindowInfo(
+            [.optionOnScreenOnly],
+            kCGNullWindowID
+        ) as? [[String: Any]] else {
+            return nil
+        }
+
+        var ids: [CGWindowID] = []
+        ids.reserveCapacity(info.count)
+        for entry in info {
+            guard let number = entry[kCGWindowNumber as String] as? CGWindowID else { continue }
+            let owner = entry[kCGWindowOwnerPID as String] as? pid_t
+            // Drop our own windows (popup, overlays, settings) so they never
+            // pollute the OCR strip — unless explicitly force-included (the
+            // self-test's probe window).
+            if owner == ownPID, !additionalIncludedWindowIDs.contains(number) {
+                continue
+            }
+            ids.append(number)
+        }
+        guard !ids.isEmpty else { return nil }
+
+        // CFArray elements are interpreted AS window IDs by value: each slot's
+        // pointer bit-pattern must equal the ID. Window IDs are non-zero, so
+        // bitPattern never yields nil for a valid entry.
+        var pointers: [UnsafeRawPointer?] = ids.map { UnsafeRawPointer(bitPattern: UInt($0)) }
+        return pointers.withUnsafeMutableBufferPointer { buffer in
+            CFArrayCreate(kCFAllocatorDefault, buffer.baseAddress, ids.count, nil)
+        }
     }
 
     /// `NSMouseInRect(_:_:false)` handles the mouse coordinate convention at

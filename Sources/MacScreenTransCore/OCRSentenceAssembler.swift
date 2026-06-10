@@ -277,53 +277,54 @@ public enum OCRSentenceAssembler {
         // lands on the line. Falls back to a fraction of the line height when
         // no median is available.
         let verticalPad = max(medianHeight * 0.75, 0.01)
-
-        var bestLine: AssembledLine?
-        var bestVerticalDistance = CGFloat.greatestFiniteMagnitude
-        for line in lines {
-            let withinPadded = tapPoint.y >= line.box.minY - verticalPad
+        let band = lines.filter { line in
+            tapPoint.y >= line.box.minY - verticalPad
                 && tapPoint.y <= line.box.maxY + verticalPad
-            guard withinPadded else { continue }
-            let distance = abs(tapPoint.y - line.box.midY)
-            if distance < bestVerticalDistance {
-                bestVerticalDistance = distance
-                bestLine = line
+        }
+        guard !band.isEmpty else { return (nil, nil) }
+
+        // Vision can split ONE visual row into several side-by-side
+        // observations (ls(1) columns, wide tab runs). Ranking by vertical
+        // distance alone then picks an arbitrary fragment of the row — the
+        // tap's x must select the fragment first: only lines whose box spans
+        // the tap horizontally compete on vertical distance.
+        let spanning = band.filter { tapPoint.x >= $0.box.minX && tapPoint.x <= $0.box.maxX }
+        if let line = spanning.min(by: { abs(tapPoint.y - $0.box.midY) < abs(tapPoint.y - $1.box.midY) }) {
+            // No per-word geometry at all (Vision's boundingBox(for:) threw
+            // for every token on this line): synthesize the word from the
+            // line text by slicing the line box proportionally at the tap's
+            // x offset.
+            guard !line.words.isEmpty else {
+                return synthesizeWord(in: line, text: text, tapPoint: tapPoint)
             }
-        }
-        guard let line = bestLine else { return (nil, nil) }
-
-        // No per-word geometry at all (Vision's boundingBox(for:) threw for
-        // every token on this line): synthesize the word from the line text
-        // by slicing the line box proportionally at the tap's x offset.
-        guard !line.words.isEmpty else {
-            return synthesizeWord(in: line, text: text, tapPoint: tapPoint)
-        }
-
-        // Of the words whose box contains the tap x, prefer the NARROWEST —
-        // a degenerate token-wide box must not shadow a properly-boxed word.
-        // Otherwise fall back to the nearest word within a horizontal
-        // tolerance so a tap in inter-word whitespace still resolves.
-        let horizontalPad = max(line.box.height, 0.01)
-        var containing: RecognizedWord?
-        var nearest: RecognizedWord?
-        var nearestDistance = CGFloat.greatestFiniteMagnitude
-        for word in line.words {
-            if tapPoint.x >= word.box.minX && tapPoint.x <= word.box.maxX {
+            // Of the words whose box contains the tap x, prefer the
+            // NARROWEST — a degenerate token-wide box must not shadow a
+            // properly-boxed word. A miss here (tap in whitespace inside
+            // this fragment) falls through to the band-wide nearest scan.
+            var containing: RecognizedWord?
+            for word in line.words where tapPoint.x >= word.box.minX && tapPoint.x <= word.box.maxX {
                 if containing == nil || word.box.width < containing!.box.width {
                     containing = word
                 }
-            } else {
-                let distance = tapPoint.x < word.box.minX
-                    ? word.box.minX - tapPoint.x
-                    : tapPoint.x - word.box.maxX
-                if distance < nearestDistance {
-                    nearestDistance = distance
-                    nearest = word
-                }
+            }
+            if let word = containing { return (word.range, word.box) }
+        }
+
+        // Tap in whitespace (between words, or in the column gap between two
+        // side-by-side fragments): nearest word horizontally across EVERY
+        // line in the band, within a tolerance of that line's height.
+        var nearest: RecognizedWord?
+        var nearestDistance = CGFloat.greatestFiniteMagnitude
+        for line in band {
+            let horizontalPad = max(line.box.height, 0.01)
+            for word in line.words {
+                let distance = max(word.box.minX - tapPoint.x, tapPoint.x - word.box.maxX, 0)
+                guard distance <= horizontalPad, distance < nearestDistance else { continue }
+                nearestDistance = distance
+                nearest = word
             }
         }
-        if let word = containing { return (word.range, word.box) }
-        if let word = nearest, nearestDistance <= horizontalPad { return (word.range, word.box) }
+        if let word = nearest { return (word.range, word.box) }
         return (nil, nil)
     }
 

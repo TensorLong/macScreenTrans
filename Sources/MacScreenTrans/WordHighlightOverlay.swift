@@ -1,13 +1,19 @@
 import AppKit
 
-/// A click-through borderless panel that draws Apple's "Look Up" yellow
-/// highlight: a rounded yellow bubble behind the recognized word, with the
-/// word redrawn slightly enlarged and lifted upward so it pops off the
-/// surrounding text. As of v0.2 the bubble fill is fully opaque so it
-/// completely covers the original glyph behind it — pairs with the green
-/// PhraseHighlightOverlay (panel level `.floating`) which sits one z-level
-/// below this one (`.popUpMenu`) so the yellow word stays on top of the
-/// green phrase band.
+/// A click-through borderless panel that tints the recognized word with a
+/// translucent yellow highlight — like a highlighter pen drawn over the text
+/// already on screen.
+///
+/// v0.4 deliberately does NOT redraw the word's glyphs. The previous design
+/// painted an opaque bubble and re-rendered the text inside it at a font size
+/// *guessed* from the box height; whenever the box was small or the guess was
+/// off, the redrawn text overflowed — the "字大框小" distortion users hit. A
+/// translucent fill over the real glyphs needs no font, so it can never
+/// mis-size the text: whatever is under the highlight is the host app's own,
+/// correctly-rendered text showing through.
+///
+/// Z-order: this panel is `.popUpMenu`, one level above the green phrase
+/// overlay (`.floating`), so the yellow word tint layers over the green band.
 @MainActor
 final class WordHighlightOverlayController {
     private let panel: NSPanel
@@ -17,6 +23,10 @@ final class WordHighlightOverlayController {
     /// otherwise a stale completion (queued while the main thread was busy)
     /// would remove a highlight that was just re-shown.
     private var generation = 0
+
+    /// Padding around the word rect so the rounded tint hugs the glyphs with
+    /// a little breathing room without swallowing neighbours.
+    private static let padding: CGFloat = 2
 
     init() {
         let initialFrame = NSRect(x: 0, y: 0, width: 10, height: 10)
@@ -30,8 +40,9 @@ final class WordHighlightOverlayController {
         // never hides behind the host app's own subviews during the brief
         // moment before the translation popup appears.
         panel.level = .popUpMenu
-        // Keep the highlight out of our own OCR screen captures.
-        panel.sharingType = .none
+        // Kept out of our own OCR captures via window-ID exclusion (see
+        // ScreenRegionCapture), NOT sharingType — so external screenshot
+        // tools can still record the highlight for debugging.
         panel.collectionBehavior = [.canJoinAllSpaces, .transient, .ignoresCycle]
         panel.isOpaque = false
         panel.backgroundColor = .clear
@@ -44,31 +55,14 @@ final class WordHighlightOverlayController {
         panel.contentView = highlightView
     }
 
-    /// Show the highlight over `wordRect` (AppKit screen coordinates).
-    /// `font` is the best available font for the word — passed in by the
-    /// caller because we usually can't introspect the host app's text run.
-    func show(word: String, font: NSFont?, at wordRect: NSRect) {
+    /// Show the translucent highlight over `wordRect` (AppKit screen coords).
+    func show(at wordRect: NSRect) {
+        guard wordRect.width > 0, wordRect.height > 0 else { return }
         generation += 1
-        // Pad the panel so the slight scale-up + upward lift don't clip.
-        let horizontalPadding: CGFloat = 8
-        let verticalPadding: CGFloat = 8
-        let frame = NSRect(
-            x: wordRect.origin.x - horizontalPadding,
-            y: wordRect.origin.y - verticalPadding,
-            width: wordRect.width + horizontalPadding * 2,
-            height: wordRect.height + verticalPadding * 2
-        )
-        highlightView.configure(
-            word: word,
-            font: font,
-            wordRectInPanel: NSRect(
-                x: horizontalPadding,
-                y: verticalPadding,
-                width: wordRect.width,
-                height: wordRect.height
-            )
-        )
+        let frame = wordRect.insetBy(dx: -Self.padding, dy: -Self.padding)
         panel.setFrame(frame, display: false)
+        highlightView.frame = NSRect(origin: .zero, size: frame.size)
+        highlightView.needsDisplay = true
         panel.alphaValue = 0
         panel.orderFrontRegardless()
 
@@ -99,65 +93,21 @@ final class WordHighlightOverlayController {
 }
 
 private final class HighlightView: NSView {
-    private var word: String = ""
-    private var font: NSFont = .systemFont(ofSize: 14)
-    private var wordRectInPanel: NSRect = .zero
-
     override var isFlipped: Bool { false }
-
-    func configure(word: String, font: NSFont?, wordRectInPanel: NSRect) {
-        self.word = word
-        // If the caller didn't give us a font, infer one whose ascender/
-        // descender roughly matches the bounded rect's height so the redraw
-        // doesn't look comically off-size.
-        if let font {
-            self.font = font
-        } else {
-            let approxPointSize = max(11, wordRectInPanel.height * 0.78)
-            self.font = .systemFont(ofSize: approxPointSize)
-        }
-        self.wordRectInPanel = wordRectInPanel
-        needsDisplay = true
-    }
 
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
-        guard wordRectInPanel.width > 0, wordRectInPanel.height > 0 else { return }
+        let rect = bounds.insetBy(dx: 0.5, dy: 0.5)
+        guard rect.width > 0, rect.height > 0 else { return }
 
-        // Yellow bubble — slightly inset so it hugs the word. Fully opaque
-        // so the bubble masks the glyph beneath it (the redraw below is the
-        // visible text). The rim is the system yellow at full alpha too;
-        // keeping fill and stroke from the same color gives the classic
-        // Look Up edge without manual color mixing.
-        let bubbleRect = wordRectInPanel.insetBy(dx: -3, dy: -2)
-        let bubblePath = NSBezierPath(roundedRect: bubbleRect, xRadius: 5, yRadius: 5)
-        NSColor.systemYellow.setFill()
-        bubblePath.fill()
-
-        // Hairline border to match Apple's Look Up shape edge.
-        NSColor.systemYellow.setStroke()
-        bubblePath.lineWidth = 0.5
-        bubblePath.stroke()
-
-        // Redraw the word ~1.05× scaled, lifted 2pt upward, so it "pops"
-        // off the surrounding text. We draw with the strongest contrast
-        // color the system theme gives us.
-        let scaledFont = NSFont(
-            descriptor: font.fontDescriptor,
-            size: font.pointSize * 1.05
-        ) ?? font
-        let attributes: [NSAttributedString.Key: Any] = [
-            .font: scaledFont,
-            .foregroundColor: NSColor.labelColor
-        ]
-        let attributed = NSAttributedString(string: word, attributes: attributes)
-        let textSize = attributed.size()
-        let liftedRect = NSRect(
-            x: wordRectInPanel.midX - textSize.width / 2,
-            y: wordRectInPanel.midY - textSize.height / 2 + 2,
-            width: textSize.width,
-            height: textSize.height
-        )
-        attributed.draw(in: liftedRect)
+        // Translucent fill over the host app's own glyphs (which show through
+        // unchanged) plus a slightly stronger rim, the highlighter look.
+        let radius = min(5, rect.height * 0.3)
+        let path = NSBezierPath(roundedRect: rect, xRadius: radius, yRadius: radius)
+        NSColor.systemYellow.withAlphaComponent(0.32).setFill()
+        path.fill()
+        NSColor.systemYellow.withAlphaComponent(0.85).setStroke()
+        path.lineWidth = 1
+        path.stroke()
     }
 }

@@ -188,6 +188,58 @@ private func word(_ text: String, _ range: Range<Int>, _ box: CGRect) -> Recogni
     }
 }
 
+@Test func assemblerResolvesAcrossSideBySideRowFragments() {
+    // Mirrors the field bug: Vision split the single visual row
+    // "drwxr-xr-x  5 brownjack staff  160 Jun ..." into THREE side-by-side
+    // observations separated by column gaps. Picking the line by vertical
+    // distance alone chose an arbitrary fragment, so a tap on "160" resolved
+    // "staff" (nearest word of the wrong fragment) and a tap on "brownjack"
+    // resolved nothing at all. The tap's x must select the fragment.
+    let left = RecognizedLine(
+        text: "drwxr",
+        box: CGRect(x: 0.20, y: 0.4827, width: 0.09, height: 0.0465),
+        words: [word("drwxr", 0..<5, CGRect(x: 0.20, y: 0.4827, width: 0.09, height: 0.0465))]
+    )
+    let middle = RecognizedLine(
+        text: "5 brownjack staff",
+        box: CGRect(x: 0.31, y: 0.4788, width: 0.156, height: 0.0503),
+        words: [
+            word("5", 0..<1, CGRect(x: 0.310, y: 0.4788, width: 0.017, height: 0.0503)),
+            word("brownjack", 2..<11, CGRect(x: 0.340, y: 0.4788, width: 0.090, height: 0.0503)),
+            word("staff", 12..<17, CGRect(x: 0.417, y: 0.4788, width: 0.045, height: 0.0503)),
+        ]
+    )
+    let right = RecognizedLine(
+        text: "160 Jun",
+        box: CGRect(x: 0.4865, y: 0.4788, width: 0.20, height: 0.0545),
+        words: [
+            word("160", 0..<3, CGRect(x: 0.4865, y: 0.4788, width: 0.032, height: 0.0545)),
+            word("Jun", 4..<7, CGRect(x: 0.5250, y: 0.4788, width: 0.035, height: 0.0545)),
+        ]
+    )
+    let lines = [left, middle, right]
+    // Assembled row: "drwxr 5 brownjack staff 160 Jun"
+    //                 0      6 8         18    24  28
+
+    // Tap inside "160": the middle fragment is vertically CLOSER (midY
+    // 0.5040 vs 0.5061) but does not span the tap's x — the right fragment
+    // must win.
+    let on160 = OCRSentenceAssembler.assemble(lines: lines, tapPoint: CGPoint(x: 0.50, y: 0.50))
+    #expect(on160.text == "drwxr 5 brownjack staff 160 Jun")
+    #expect(on160.tappedWordRange == 24..<27)
+
+    // Tap inside "brownjack" at a y nearer the RIGHT fragment's midY: only
+    // the middle fragment spans the x, so it must still win.
+    let onBrownjack = OCRSentenceAssembler.assemble(lines: lines, tapPoint: CGPoint(x: 0.36, y: 0.508))
+    #expect(onBrownjack.tappedWordRange == 8..<17)
+
+    // Tap in the column gap between fragments (no line spans the x): the
+    // nearest word across the whole row band resolves — "160" at distance
+    // 0.0115 beats "staff" at 0.013.
+    let inGap = OCRSentenceAssembler.assemble(lines: lines, tapPoint: CGPoint(x: 0.475, y: 0.50))
+    #expect(inGap.tappedWordRange == 24..<27)
+}
+
 @Test func assemblerReturnsNilWhenTapMissesEveryLine() {
     let line = RecognizedLine(
         text: "hello world",
