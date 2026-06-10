@@ -23,8 +23,12 @@ enum OCRWordReader {
     /// screen so a tapped line is never clipped horizontally.
     static let stripHeight: CGFloat = 260
 
-    /// BCP-47 recognition languages, source language first.
-    static let recognitionLanguages: [String] = ["en-US", "zh-Hans", "zh-Hant", "ja-JP", "ko-KR"]
+    /// BCP-47 recognition languages. zh-Hans MUST lead: with en-US first,
+    /// Vision renders mixed zh/en lines as Latin garbage and drops
+    /// pure-Chinese lines entirely (verified empirically on terminal
+    /// screenshots); with zh-Hans first both scripts come back intact and
+    /// English-only lines are unaffected.
+    static let recognitionLanguages: [String] = ["zh-Hans", "en-US", "zh-Hant", "ja-JP", "ko-KR"]
 
     private static let capture: ScreenRegionCapturing = LegacyWindowListCapture()
 
@@ -79,14 +83,37 @@ enum OCRWordReader {
         }
     }
 
+    /// Resolve the word under `appKitPoint`. The screen lookup happens on the
+    /// main actor; the pixel capture, Vision OCR and assembly run on a
+    /// background task so a tap never freezes the UI (Vision at .accurate is
+    /// hundreds of milliseconds per strip, seconds on first use).
     @MainActor
-    static func resolve(at appKitPoint: CGPoint, radius: Int = 200) -> Result? {
-        var diag: [String] = []
-        defer { lastDiagnostic = diag.joined(separator: "\n") }
-
-        guard let region = capture.capture(around: appKitPoint, stripHeight: stripHeight) else {
-            diag.append("capture: failed — no screen or capture API returned nil")
+    static func resolve(at appKitPoint: CGPoint, radius: Int = 200) async -> Result? {
+        guard let plan = capture.plan(around: appKitPoint, stripHeight: stripHeight) else {
+            lastDiagnostic = "capture: failed — no screen under the tap point"
             return nil
+        }
+
+        let (result, diagnostic) = await Task.detached(priority: .userInitiated) {
+            recognizeAndAssemble(plan: plan, appKitPoint: appKitPoint, radius: radius)
+        }.value
+        lastDiagnostic = diagnostic
+        return result
+    }
+
+    /// The heavy half of `resolve`, safe to run on any thread: everything it
+    /// touches is either a value, the Sendable capture backend, or Vision —
+    /// no AppKit state.
+    private static func recognizeAndAssemble(
+        plan: CaptureStripPlan,
+        appKitPoint: CGPoint,
+        radius: Int
+    ) -> (Result?, String) {
+        var diag: [String] = []
+
+        guard let region = capture.capture(plan) else {
+            diag.append("capture: failed — capture API returned nil")
+            return (nil, diag.joined(separator: "\n"))
         }
         diag.append("capture: \(region.image.width)×\(region.image.height)px frame=\(Self.describe(region.screenFrame))")
 
@@ -95,14 +122,14 @@ enum OCRWordReader {
         diag.append("ocr: \(lines.count) line(s)")
         guard !lines.isEmpty else {
             diag.append("ocr: no text recognized in strip")
-            return nil
+            return (nil, diag.joined(separator: "\n"))
         }
 
         let tapNorm = OCRGeometry.normalizedTapPoint(appKitPoint, in: region.screenFrame)
         let assembled = OCRSentenceAssembler.assemble(lines: lines, tapPoint: tapNorm)
         guard let wordRange = assembled.tappedWordRange else {
             diag.append("locate: no word under tap (norm=\(Self.describe(tapNorm)))")
-            return nil
+            return (nil, diag.joined(separator: "\n"))
         }
 
         guard let selection = WordContextExtractor.selection(
@@ -111,20 +138,21 @@ enum OCRWordReader {
             radius: radius
         ) else {
             diag.append("extract: WordContextExtractor nil at offset \(wordRange.lowerBound)")
-            return nil
+            return (nil, diag.joined(separator: "\n"))
         }
         diag.append("word=\(selection.word.debugDescription) range=\(wordRange.lowerBound)..<\(wordRange.upperBound)")
 
         let wordRect = assembled.tappedWordBox.map {
             OCRGeometry.screenRect(fromNormalizedTopLeft: $0, in: region.screenFrame)
         }
-        return Result(
+        let result = Result(
             selection: selection,
             wordRect: wordRect,
             clickedWordRangeInLookupText: wordRange,
             assembled: assembled,
             screenFrame: region.screenFrame
         )
+        return (result, diag.joined(separator: "\n"))
     }
 
     private static func describe(_ rect: NSRect) -> String {

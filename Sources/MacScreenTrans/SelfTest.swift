@@ -60,12 +60,12 @@ private final class SelfTestDelegate: NSObject, NSApplicationDelegate {
         // Give WindowServer time to composite the window before screenshotting.
         Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: 1_200_000_000)
-            self?.runProbes()
+            await self?.runProbes()
             exit(0)
         }
     }
 
-    private func runProbes() {
+    private func runProbes() async {
         guard let window, let textView else {
             print("[SelfTest] FAIL: window/textView missing")
             return
@@ -94,7 +94,7 @@ private final class SelfTestDelegate: NSObject, NSApplicationDelegate {
 
         for (name, pt) in positions {
             print("--- probe[\(name)] AppKit=(\(Int(pt.x)),\(Int(pt.y))) ---")
-            if let result = OCRWordReader.resolve(at: pt) {
+            if let result = await OCRWordReader.resolve(at: pt) {
                 print("✓ word=\"\(result.selection.word)\"")
                 if let rect = result.wordRect {
                     print("  wordRect=(\(Int(rect.minX)),\(Int(rect.minY))) \(Int(rect.width))×\(Int(rect.height))")

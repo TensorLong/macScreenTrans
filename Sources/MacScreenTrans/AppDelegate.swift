@@ -9,11 +9,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let statusMenu = NSMenu()
     private var settingsWindow: SettingsWindowController?
     private var streamingTask: Task<Void, Never>?
+    /// Monotonic token for the tap → resolve → stream pipeline. Every UI
+    /// write from an async continuation re-checks it, so a superseded tap
+    /// (or a popup the user already closed) can never repaint the popup or
+    /// resurrect stale overlays. Cancellation alone is not enough:
+    /// AsyncThrowingStream ends with nil instead of throwing when its
+    /// consumer task is cancelled, so the post-stream code keeps running.
+    private var tapGeneration = 0
+    /// True while an OCR resolve is in flight; taps arriving meanwhile are
+    /// dropped instead of queueing (a queued tap would re-read the cursor
+    /// position later and OCR wherever it drifted to).
+    private var resolveInFlight = false
     private lazy var popup: FloatingTranslationWindowController = {
         let controller = FloatingTranslationWindowController()
         controller.setOnClose { [weak self] in
-            self?.highlightOverlay.hide()
-            self?.phraseOverlay.hide()
+            guard let self else { return }
+            // Closing the popup invalidates the in-flight pipeline —
+            // otherwise a still-streaming task would resurrect the overlays
+            // (or repaint the popup) seconds after the user dismissed it.
+            self.tapGeneration += 1
+            self.streamingTask?.cancel()
+            self.streamingTask = nil
+            self.highlightOverlay.hide()
+            self.phraseOverlay.hide()
         }
         return controller
     }()
@@ -164,7 +182,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func handleThreeFingerTap() {
+        // Drop taps while a resolve is still running: a queued tap would
+        // re-read the cursor later and OCR wherever it drifted to.
+        guard !resolveInFlight else { return }
+
+        tapGeneration += 1
+        let generation = tapGeneration
         streamingTask?.cancel()
+        streamingTask = nil
         highlightOverlay.hide()
         phraseOverlay.hide()
         let point = NSEvent.mouseLocation
@@ -178,33 +203,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        // No AX role gate any more: the OCR reader IS the text detector. When
-        // the tap doesn't land on a recognized word, `resolve` returns nil
-        // with a populated diagnostic, and we show the same compact popup
-        // (no LLM round-trip) the role gate used to.
-        guard let result = OCRWordReader.resolve(at: point) else {
-            popup.show(
-                at: point,
-                text: """
-                当前位置未识别到文字。
-                请把鼠标放在屏幕上清晰可见的文字上再试。
+        // Immediate feedback at the cursor; OCR runs off the main thread and
+        // the popup re-anchors once the word geometry is known.
+        popup.show(at: point, text: "取词中...")
 
-                — OCR 诊断（v\(AppConfiguration.appVersion) debug）—
-                \(OCRWordReader.lastDiagnostic)
-                """
-            )
-            return
+        resolveInFlight = true
+        Task { @MainActor in
+            // No AX role gate any more: the OCR reader IS the text detector.
+            // When the tap doesn't land on a recognized word, `resolve`
+            // returns nil with a populated diagnostic, and we show the same
+            // compact popup (no LLM round-trip) the role gate used to.
+            let result = await OCRWordReader.resolve(at: point)
+            self.resolveInFlight = false
+            guard self.tapGeneration == generation else { return }
+            guard let result else {
+                self.popup.show(
+                    at: point,
+                    text: """
+                    当前位置未识别到文字。
+                    请把鼠标放在屏幕上清晰可见的文字上再试。
+
+                    — OCR 诊断（v\(AppConfiguration.appVersion) debug）—
+                    \(OCRWordReader.lastDiagnostic)
+                    """
+                )
+                return
+            }
+            self.startTranslation(for: result, generation: generation)
         }
+    }
+
+    private func startTranslation(for result: OCRWordReader.Result, generation: Int) {
         let selection = result.selection
 
-        // Show the popup anchored to the recognized word's screen rect when
-        // AX gives us bounds. Otherwise fall back to the cursor — this still
+        // Re-anchor the popup to the recognized word's screen rect when OCR
+        // gives us bounds. Otherwise it stays at the cursor — this still
         // happens for image PDFs / custom UIs that don't report bounds.
         if let wordRect = result.wordRect {
             highlightOverlay.show(word: selection.word, font: nil, at: wordRect)
             popup.show(anchoredTo: wordRect, text: "取词中...")
-        } else {
-            popup.show(at: point, text: "取词中...")
         }
 
         let config = AppConfiguration.current
@@ -225,22 +262,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // the right occurrence but the old single-word anchor was too
         // narrow to recognise it.
         let positionString = PromptBuilder.position(for: selection)
-        streamingTask = Task { [client, popup, phraseOverlay, highlightOverlay, lookupBox, positionString] in
+        streamingTask = Task { @MainActor in
+            // A UI write is allowed only while this tap is still the active
+            // generation AND nobody cancelled us. The generation is the
+            // load-bearing check: the stream iterator ends with nil instead
+            // of throwing when its consumer task is cancelled, so execution
+            // reaches the post-stream branches even after a cancel().
+            @MainActor func stillCurrent() -> Bool {
+                self.tapGeneration == generation && !Task.isCancelled
+            }
             do {
                 var output = ""
-                for try await delta in client.streamExplanation(selection: selection, config: config) {
+                for try await delta in self.client.streamExplanation(selection: selection, config: config) {
                     output += delta
-                    await MainActor.run {
-                        popup.update(SenseGroupResponseRenderer.displayText(
-                            for: output.isEmpty ? "正在识别意群..." : output,
-                            overrideWord: selection.word
-                        ))
-                    }
+                    guard stillCurrent() else { return }
+                    self.popup.update(SenseGroupResponseRenderer.displayText(
+                        for: output.isEmpty ? "正在识别意群..." : output,
+                        overrideWord: selection.word
+                    ))
                 }
+                guard stillCurrent() else { return }
                 if output.isEmpty {
-                    await MainActor.run {
-                        popup.update("模型没有返回内容。")
-                    }
+                    self.popup.update("模型没有返回内容。")
                 } else if let response = SenseGroupResponseRenderer.response(for: output) {
                     // Reveal the green phrase overlay as soon as the LLM gives us
                     // a usable source phrase, regardless of whether we'll later
@@ -252,38 +295,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     // a single segment happens to be tall (Issue 1 fix).
                     if !response.source.isEmpty {
                         let phrase = response.source
-                        await MainActor.run {
-                            let segs = lookupBox.result.phraseSegments(for: phrase, positionString: positionString)
-                            if !segs.isEmpty {
-                                let phraseFont: NSFont?
-                                if let wordRect = lookupBox.result.wordRect {
-                                    phraseFont = .systemFont(ofSize: max(11, wordRect.height * 0.78))
-                                } else {
-                                    phraseFont = nil
-                                }
-                                phraseOverlay.show(segments: segs, font: phraseFont)
+                        let segs = lookupBox.result.phraseSegments(for: phrase, positionString: positionString)
+                        if !segs.isEmpty {
+                            let phraseFont: NSFont?
+                            if let wordRect = lookupBox.result.wordRect {
+                                phraseFont = .systemFont(ofSize: max(11, wordRect.height * 0.78))
+                            } else {
+                                phraseFont = nil
+                            }
+                            self.phraseOverlay.show(segments: segs, font: phraseFont)
 
-                                // Option B: yellow word box was missing
-                                // because `boundsForRange` returned nil for
-                                // the word range (soft-wrap / zero-width-
-                                // space / odd web glyph — Issue 3). When
-                                // green segments DID resolve, slice the
-                                // matching segment proportionally to land
-                                // yellow on the word visually. We pass the
-                                // cursor anchor so a sentence with two of
-                                // the same word still gets yellow on the
-                                // occurrence the user pointed at.
-                                if lookupBox.result.wordRect == nil,
-                                   let derivedRect = Self.deriveWordRectFromSegments(
-                                    segments: segs,
-                                    clickedWordRange: lookupBox.result.clickedWordRangeInLookupText
-                                   ) {
-                                    highlightOverlay.show(
-                                        word: selection.word,
-                                        font: nil,
-                                        at: derivedRect
-                                    )
-                                }
+                            // Option B: yellow word box was missing
+                            // because `boundsForRange` returned nil for
+                            // the word range (soft-wrap / zero-width-
+                            // space / odd web glyph — Issue 3). When
+                            // green segments DID resolve, slice the
+                            // matching segment proportionally to land
+                            // yellow on the word visually. We pass the
+                            // cursor anchor so a sentence with two of
+                            // the same word still gets yellow on the
+                            // occurrence the user pointed at.
+                            if lookupBox.result.wordRect == nil,
+                               let derivedRect = Self.deriveWordRectFromSegments(
+                                segments: segs,
+                                clickedWordRange: lookupBox.result.clickedWordRangeInLookupText
+                               ) {
+                                self.highlightOverlay.show(
+                                    word: selection.word,
+                                    font: nil,
+                                    at: derivedRect
+                                )
                             }
                         }
                     }
@@ -292,9 +333,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         targetLanguage: config.targetLanguage
                     ) {
                         let fallbackSource = response.source.isEmpty ? selection.word : response.source
-                        await MainActor.run {
-                            popup.update("单词: \(selection.word)\n意群: \(fallbackSource)\n译文: 正在补译...")
-                        }
+                        self.popup.update("单词: \(selection.word)\n意群: \(fallbackSource)\n译文: 正在补译...")
                         let fallbackSelection = WordSelection(
                             word: fallbackSource,
                             context: fallbackSource,
@@ -303,39 +342,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         var fallbackConfig = config
                         fallbackConfig.promptTemplate = PromptBuilder.translationOnlyPromptTemplate
                         var fallbackOutput = ""
-                        for try await delta in client.streamExplanation(selection: fallbackSelection, config: fallbackConfig) {
+                        for try await delta in self.client.streamExplanation(selection: fallbackSelection, config: fallbackConfig) {
                             fallbackOutput += delta
-                            await MainActor.run {
-                                let target = SenseGroupResponseRenderer.plainTranslationText(for: fallbackOutput)
-                                popup.update("单词: \(selection.word)\n意群: \(fallbackSource)\n译文: \(target.isEmpty ? "正在补译..." : target)")
-                            }
+                            guard stillCurrent() else { return }
+                            let target = SenseGroupResponseRenderer.plainTranslationText(for: fallbackOutput)
+                            self.popup.update("单词: \(selection.word)\n意群: \(fallbackSource)\n译文: \(target.isEmpty ? "正在补译..." : target)")
                         }
+                        guard stillCurrent() else { return }
                         let finalTarget = SenseGroupResponseRenderer.plainTranslationText(for: fallbackOutput)
-                        await MainActor.run {
-                            popup.update(
-                                "单词: \(selection.word)\n意群: \(fallbackSource)\n译文: \(finalTarget.isEmpty ? "模型没有返回译文，请重试。" : finalTarget)"
-                            )
-                        }
+                        self.popup.update(
+                            "单词: \(selection.word)\n意群: \(fallbackSource)\n译文: \(finalTarget.isEmpty ? "模型没有返回译文，请重试。" : finalTarget)"
+                        )
                     } else {
-                        await MainActor.run {
-                            popup.update(SenseGroupResponseRenderer.displayText(for: output, overrideWord: selection.word))
-                        }
+                        self.popup.update(SenseGroupResponseRenderer.displayText(for: output, overrideWord: selection.word))
                     }
-                } else if SenseGroupResponseRenderer.isLikelyStructuredResponse(output),
-                          SenseGroupResponseRenderer.response(for: output) == nil {
-                    await MainActor.run {
-                        popup.update("模型返回格式不完整。\n请在设置页点击“恢复默认”后重试，或换一个模型。")
-                    }
-                } else if SenseGroupResponseRenderer.response(for: output) == nil {
-                    await MainActor.run {
-                        popup.update("模型没有按要求返回译文 JSON。\n请在设置页点击“恢复默认”后重试，或换一个模型。")
-                    }
+                } else {
+                    // The model ignored the JSON contract — pure machine-
+                    // translation models do. The raw text is almost always
+                    // the translation itself, so show it instead of
+                    // discarding the answer behind a format error.
+                    let plain = SenseGroupResponseRenderer.plainTranslationText(for: output)
+                    self.popup.update("单词: \(selection.word)\n译文: \(plain)")
                 }
             } catch is CancellationError {
             } catch {
-                await MainActor.run {
-                    popup.update(Self.friendlyErrorMessage(for: error))
-                }
+                guard stillCurrent() else { return }
+                self.popup.update(Self.friendlyErrorMessage(for: error))
             }
         }
     }
