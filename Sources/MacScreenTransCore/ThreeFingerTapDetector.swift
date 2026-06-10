@@ -7,6 +7,11 @@ public struct ThreeFingerTapDetector {
     public var debounceInterval: TimeInterval
 
     private var activeTouchStartedAt: TimeInterval?
+    /// First frame with all three fingers firmly down — the duration anchor.
+    /// Staggered landings (finger 1 at t=0, finger 3 at t=0.2) must not be
+    /// charged against the tap budget, or casual real-world taps whose
+    /// three-fingers-down phase was brief get rejected with "duration > max".
+    private var threeFingersAt: TimeInterval?
     private var peakContactCount: Int32 = 0
     private var startCentroid: (x: Float, y: Float)?
     private var recordedMaxDrift: Float = 0
@@ -56,8 +61,11 @@ public struct ThreeFingerTapDetector {
             if contactCount >= 3 {
                 if startCentroid == nil {
                     // First frame with all three fingers firmly down. Anchor
-                    // here — before this point the centroid averages 1 or 2
-                    // fingers and reflects nothing meaningful about drift.
+                    // BOTH the drift origin and the duration clock here —
+                    // before this point the centroid averages 1 or 2 fingers
+                    // and reflects nothing meaningful about drift, and the
+                    // staggered-landing time isn't part of the tap proper.
+                    threeFingersAt = timestamp
                     startCentroid = (centroidX, centroidY)
                     recordedMaxDrift = 0
                 } else if let start = startCentroid {
@@ -72,15 +80,17 @@ public struct ThreeFingerTapDetector {
             return
         }
 
-        guard let startedAt = activeTouchStartedAt else { return }
+        guard activeTouchStartedAt != nil else { return }
         let peak = peakContactCount
         let drift = recordedMaxDrift
+        let anchor = threeFingersAt
         activeTouchStartedAt = nil
+        threeFingersAt = nil
         peakContactCount = 0
         startCentroid = nil
         recordedMaxDrift = 0
 
-        guard peak == 3 else {
+        guard peak == 3, let startedAt = anchor else {
             lastRejection = "peak=\(peak), expected 3"
             return
         }

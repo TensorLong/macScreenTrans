@@ -2,12 +2,18 @@
 #define CMultitouchSupport_h
 
 #include <stdbool.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-typedef void (*MSTouchFrameCallback)(int contactCount, double timestamp, int frame,
+// deviceID is the MTDeviceRef pointer value, stable for the device's
+// lifetime. Frames from different devices (built-in trackpad, external
+// Magic Trackpad) MUST be tracked separately — interleaving them into one
+// gesture detector lets a hand resting on one device poison taps on the
+// other.
+typedef void (*MSTouchFrameCallback)(uint64_t deviceID, int contactCount, double timestamp, int frame,
                                      float centroidX, float centroidY, void *context);
 
 bool MSTrackpadStart(MSTouchFrameCallback callback, void *context, char *errorBuffer, int errorBufferLength);

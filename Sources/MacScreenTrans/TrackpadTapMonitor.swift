@@ -6,28 +6,23 @@ final class TrackpadTapMonitor: @unchecked Sendable {
     var onTap: (() -> Void)?
 
     private let queue = DispatchQueue(label: "MacScreenTrans.TrackpadTapMonitor")
-    private var detector: ThreeFingerTapDetector
+    /// One detector per multitouch device. Frames from a built-in trackpad
+    /// and an external surface must never interleave into one gesture
+    /// state: a hand resting on the other device would hold the gesture
+    /// "active" for minutes and every real tap would be rejected with
+    /// "duration > max".
+    private var detectors: [UInt64: ThreeFingerTapDetector] = [:]
     private(set) var isRunning = false
     private(set) var lastError: String?
 
-    /// Diagnostic surface: the detector's last-rejection string, read across
-    /// the queue boundary. Used by the settings self-check report so the
-    /// user can see why a 3-finger gesture they just performed didn't fire
-    /// instead of having to ask the QA (us) to read source.
+    /// Diagnostic surface: the per-device detectors' last-rejection strings,
+    /// read across the queue boundary. Used by the settings self-check
+    /// report so the user can see why a 3-finger gesture they just performed
+    /// didn't fire instead of having to ask the QA (us) to read source.
     var lastRejection: String {
-        queue.sync { detector.lastRejection }
-    }
-
-    init() {
-        detector = ThreeFingerTapDetector {}
-        detector = ThreeFingerTapDetector { [weak self] in
-            // Hoist `onTap` out of `self` before hopping to the main queue so
-            // the escaping closure sends a captured function value, not the
-            // monitor itself, across the concurrency boundary (Swift 6).
-            guard let onTap = self?.onTap else { return }
-            DispatchQueue.main.async {
-                onTap()
-            }
+        queue.sync {
+            let rejections = detectors.values.map(\.lastRejection).filter { $0 != "(none)" }
+            return rejections.isEmpty ? "(none)" : rejections.joined(separator: " | ")
         }
     }
 
@@ -53,32 +48,52 @@ final class TrackpadTapMonitor: @unchecked Sendable {
         guard isRunning else { return }
         MSTrackpadStop()
         isRunning = false
+        queue.async { [weak self] in
+            self?.detectors.removeAll()
+        }
     }
 
     deinit {
         stop()
     }
 
+    private func makeDetector() -> ThreeFingerTapDetector {
+        ThreeFingerTapDetector { [weak self] in
+            // Hoist `onTap` out of `self` before hopping to the main queue so
+            // the escaping closure sends a captured function value, not the
+            // monitor itself, across the concurrency boundary (Swift 6).
+            guard let onTap = self?.onTap else { return }
+            DispatchQueue.main.async {
+                onTap()
+            }
+        }
+    }
+
     private func process(
+        deviceID: UInt64,
         contactCount: Int32,
         timestamp: TimeInterval,
         centroidX: Float,
         centroidY: Float
     ) {
         queue.async { [weak self] in
-            self?.detector.process(
+            guard let self else { return }
+            var detector = self.detectors[deviceID] ?? self.makeDetector()
+            detector.process(
                 contactCount: contactCount,
                 timestamp: timestamp,
                 centroidX: centroidX,
                 centroidY: centroidY
             )
+            self.detectors[deviceID] = detector
         }
     }
 
-    private static let touchCallback: MSTouchFrameCallback = { contactCount, timestamp, _, centroidX, centroidY, context in
+    private static let touchCallback: MSTouchFrameCallback = { deviceID, contactCount, timestamp, _, centroidX, centroidY, context in
         guard let context else { return }
         let monitor = Unmanaged<TrackpadTapMonitor>.fromOpaque(context).takeUnretainedValue()
         monitor.process(
+            deviceID: deviceID,
             contactCount: contactCount,
             timestamp: timestamp,
             centroidX: centroidX,

@@ -786,6 +786,23 @@ import CMultitouchSupport
     #expect(recognized)
 }
 
+@Test func threeFingerTapDetectorMeasuresDurationFromThreeFingersDown() {
+    // Staggered landing: finger 1 at t=0, finger 2 at t=0.15, finger 3 at
+    // t=0.25, release at t=0.45. Total contact is 0.45s (over the 0.28s
+    // ceiling), but the three-fingers-down phase is only 0.20s — the tap
+    // must fire. The old anchor (first firm contact) rejected this with
+    // "duration > max".
+    var recognized = false
+    var detector = ThreeFingerTapDetector { recognized = true }
+
+    detector.process(contactCount: 1, timestamp: 10.00, centroidX: 0.5, centroidY: 0.5)
+    detector.process(contactCount: 2, timestamp: 10.15, centroidX: 0.5, centroidY: 0.5)
+    detector.process(contactCount: 3, timestamp: 10.25, centroidX: 0.5, centroidY: 0.5)
+    detector.process(contactCount: 0, timestamp: 10.45, centroidX: 0.5, centroidY: 0.5)
+
+    #expect(recognized)
+}
+
 @Test func threeFingerTapDetectorAcceptsDriftJustBelowThreshold() {
     // Drift = 0.079 (just under the 0.08 ceiling) — should fire.
     var recognized = false

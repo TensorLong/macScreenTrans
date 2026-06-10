@@ -14,6 +14,7 @@ typedef void (*MTRegisterContactFrameCallbackFunction)(MTDeviceRef device, MTCon
 typedef void (*MTUnregisterContactFrameCallbackFunction)(MTDeviceRef device, MTContactCallbackFunction callback);
 typedef void (*MTDeviceStartFunction)(MTDeviceRef device, int flags);
 typedef void (*MTDeviceStopFunction)(MTDeviceRef device);
+typedef OSStatus (*MTDeviceGetFamilyIDFunction)(MTDeviceRef device, int *familyID);
 
 // Canonical MTTouch layout (96 bytes) as reverse-engineered by:
 //   - mkalten/twongseng
@@ -95,16 +96,25 @@ void MSComputeCentroid(const void *touchesBuffer, int contactCount,
 }
 
 static int touchFrameCallback(MTDeviceRef device, void *data, int contactCount, double timestamp, int frame) {
-    (void)device;
     int firm = 0;
     float cx = 0.0f, cy = 0.0f;
     if (data && contactCount > 0) {
         MSComputeCentroid(data, contactCount, &firm, &cx, &cy);
     }
     if (gCallback != NULL) {
-        gCallback(firm, timestamp, frame, cx, cy, gContext);
+        gCallback((uint64_t)(uintptr_t)device, firm, timestamp, frame, cx, cy, gContext);
     }
     return 0;
+}
+
+// Magic Mouse multitouch family IDs (1st/2nd generation). The mouse's top
+// shell is a raw multitouch surface that streams resting-hand contacts with
+// no palm rejection at this layer; feeding those frames into tap detection
+// poisons the gesture for anyone pointing with the mouse. Filtering is
+// best-effort (the symbol is private and may vanish) — the per-device
+// detector split on the Swift side is the structural defense.
+static bool isMagicMouseFamily(int familyID) {
+    return familyID == 112 || familyID == 113;
 }
 
 bool MSTrackpadStart(MSTouchFrameCallback callback, void *context, char *errorBuffer, int errorBufferLength) {
@@ -151,11 +161,28 @@ bool MSTrackpadStart(MSTouchFrameCallback callback, void *context, char *errorBu
     gCallback = callback;
     gContext = context;
 
+    MTDeviceGetFamilyIDFunction getFamilyID =
+        (MTDeviceGetFamilyIDFunction)dlsym(gFramework, "MTDeviceGetFamilyID");
+
     CFIndex count = CFArrayGetCount(gDevices);
+    CFIndex started = 0;
     for (CFIndex index = 0; index < count; index++) {
         MTDeviceRef device = (MTDeviceRef)CFArrayGetValueAtIndex(gDevices, index);
+        if (getFamilyID != NULL) {
+            int familyID = 0;
+            if (getFamilyID(device, &familyID) == 0 && isMagicMouseFamily(familyID)) {
+                continue;
+            }
+        }
         registerCallback(device, touchFrameCallback);
         deviceStart(device, 0);
+        started++;
+    }
+
+    if (started == 0) {
+        writeError(errorBuffer, errorBufferLength, "No multitouch trackpad devices found");
+        MSTrackpadStop();
+        return false;
     }
 
     writeError(errorBuffer, errorBufferLength, "");
