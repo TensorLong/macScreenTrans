@@ -42,6 +42,30 @@ import CMultitouchSupport
     #expect(selection.word == "word's")
 }
 
+@Test func wordContextExtractorJoinsSymbolCompoundsIntoOneWord() throws {
+    // Field report: tapping the "D" of "R&D" looked up the single letter
+    // "D". Symbol-joined compounds must resolve as ONE word when the joiner
+    // is flanked by core characters on both sides.
+    let text = "AI R&D evaluations. Fable runs on Node.js 3.14 today"
+
+    let onD = try #require(WordContextExtractor.selection(
+        in: text, utf16Offset: text.utf16Offset(of: "D evaluations")))
+    #expect(onD.word == "R&D")
+
+    let onJs = try #require(WordContextExtractor.selection(
+        in: text, utf16Offset: text.utf16Offset(of: "js")))
+    #expect(onJs.word == "Node.js")
+
+    let onDigits = try #require(WordContextExtractor.selection(
+        in: text, utf16Offset: text.utf16Offset(of: "14")))
+    #expect(onDigits.word == "3.14")
+
+    // A sentence-final dot is followed by whitespace — never joined.
+    let onEvaluations = try #require(WordContextExtractor.selection(
+        in: text, utf16Offset: text.utf16Offset(of: "evaluations")))
+    #expect(onEvaluations.word == "evaluations")
+}
+
 @Test func wordContextExtractorReportsAbsoluteWordRangeInSourceForDuplicateWord() throws {
     // Same word twice in the same sentence. The extractor must report the
     // word's range anchored at the cursor offset — not at the first

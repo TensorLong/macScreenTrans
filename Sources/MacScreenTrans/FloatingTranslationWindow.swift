@@ -935,6 +935,12 @@ fileprivate final class OpaqueBubbleFillView: NSView {
         maskLayer.path = path
         maskLayer.frame = bounds
         layer.mask = maskLayer
+        // The panel's size is locked (min==max), so swapping bubble shapes
+        // (cursor-fallback rounded rect ↔ anchored tail bubble) never
+        // triggers AppKit's own shadow recomputation — the old shape's
+        // shadow rim lingers as a ghost outline below the new bubble.
+        // Recompute explicitly every time the mask changes.
+        window?.invalidateShadow()
     }
 
     override func draw(_ dirtyRect: NSRect) {

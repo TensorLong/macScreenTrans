@@ -77,7 +77,7 @@ private final class SelfTestDelegate: NSObject, NSApplicationDelegate {
     private static let scenarios: [Scenario] = [
         Scenario(
             name: "clean",
-            text: "The quick brown fox jumps over the lazy dog right now",
+            text: "The quick brown fox jumps over the lazy dog near R&D now",
             font: .systemFont(ofSize: 28),
             textColor: .black,
             backgroundColor: .white,
@@ -86,10 +86,12 @@ private final class SelfTestDelegate: NSObject, NSApplicationDelegate {
                 ProbeSpec("brown"),
                 ProbeSpec("over"),
                 ProbeSpec("dog"),
-                ProbeSpec("now"),
+                // Symbol-joined compound: a tap anywhere in "R&D" must
+                // resolve the whole compound, not the letter under the tap.
+                ProbeSpec("R&D"),
             ],
             phrase: "quick brown fox",
-            viewSize: NSSize(width: 800, height: 60)
+            viewSize: NSSize(width: 900, height: 60)
         ),
         Scenario(
             name: "terminal",
@@ -152,6 +154,10 @@ private final class SelfTestDelegate: NSObject, NSApplicationDelegate {
             // word, force the pointing-hand shape, and resolve.
             let cursorFailures = await self.runCursorOcclusionCheck()
             wordFailures += cursorFailures
+
+            if ProcessInfo.processInfo.environment["MST_CHROME_DUMP"] != nil {
+                await self.dumpPopupChrome()
+            }
 
             print("=== Self-test summary ===")
             print("resolve failures: \(resolveFailures)")
@@ -346,6 +352,38 @@ private final class SelfTestDelegate: NSObject, NSApplicationDelegate {
         }
         print()
         return failures
+    }
+
+    /// MST_CHROME_DUMP=1: replay the field tap flow (cursor-fallback bubble,
+    /// then the anchored tail bubble) over a white backdrop and screenshot
+    /// the region with the system tool, for visual inspection of the bubble
+    /// chrome. This is how the stale-shadow ghost outline below the bubble
+    /// (the field "extra border line" report) was reproduced and verified
+    /// fixed — pixel assertions can't see window-server shadows, eyes can.
+    private func dumpPopupChrome() async {
+        // White backdrop: the field artifact is a faint light hairline,
+        // invisible over the terminal scenario's dark background.
+        presentWindow(for: Self.scenarios[0])
+        try? await Task.sleep(nanoseconds: 800_000_000)
+        guard let aim = screenRect(forSubstring: "brown"),
+              let primary = NSScreen.screens.first(where: { $0.frame.origin == .zero }) else { return }
+        let popup = FloatingTranslationWindowController()
+        // Mirror the field tap flow: cursor-fallback bubble (no tail, body
+        // fills the whole panel) first, then the anchored tail bubble.
+        popup.show(at: NSPoint(x: aim.midX, y: aim.midY), text: "取词中...")
+        try? await Task.sleep(nanoseconds: 400_000_000)
+        popup.show(anchoredTo: aim, text: "翻译完成")
+        try? await Task.sleep(nanoseconds: 1_200_000_000)
+
+        let x = Int(aim.midX - 250)
+        let quartzY = Int(primary.frame.maxY - aim.maxY - 260)
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
+        task.arguments = ["-x", "-R\(x),\(quartzY),500,310", "/tmp/popup-chrome.png"]
+        try? task.run()
+        task.waitUntilExit()
+        print("[SelfTest] popup chrome dump: /tmp/popup-chrome.png")
+        popup.close()
     }
 
     // MARK: - Window plumbing

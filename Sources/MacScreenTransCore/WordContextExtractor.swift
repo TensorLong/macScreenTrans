@@ -104,7 +104,13 @@ public enum WordContextExtractor {
         if isCoreToken(character) {
             return true
         }
-        if character == "'" || character == "\u{2019}" || character == "-" {
+        // Joiners glue a compound into ONE word only when flanked by core
+        // characters on BOTH sides: apostrophes (don't), hyphen (e-mail),
+        // ampersand (R&D, AT&T), dot (U.S., Node.js, 3.14). A sentence-final
+        // dot never joins — its right neighbour is whitespace. "/" is
+        // deliberately NOT a joiner so path components stay separate words.
+        if character == "'" || character == "\u{2019}" || character == "-"
+            || character == "&" || character == "." {
             let hasLeft = index > 0 && isCoreToken(characters[index - 1].character)
             let hasRight = index + 1 < characters.count && isCoreToken(characters[index + 1].character)
             return hasLeft && hasRight

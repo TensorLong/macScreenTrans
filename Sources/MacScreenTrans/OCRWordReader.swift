@@ -153,15 +153,26 @@ enum OCRWordReader {
             diag.append("extract: WordContextExtractor nil at offset \(wordRange.lowerBound)")
             return (nil, diag.joined(separator: "\n"))
         }
-        diag.append("word=\(selection.word.debugDescription) range=\(wordRange.lowerBound)..<\(wordRange.upperBound)")
+        // The extractor may widen the OCR token across joiners ("D" → "R&D"):
+        // anchor and highlight must follow the LINGUISTIC word, not the
+        // Vision token, or the yellow box covers one letter of a compound.
+        let linguisticRange = selection.wordRangeInSource ?? wordRange
+        diag.append("word=\(selection.word.debugDescription) range=\(linguisticRange.lowerBound)..<\(linguisticRange.upperBound)")
 
-        let wordRect = assembled.tappedWordBox.map {
-            OCRGeometry.screenRect(fromNormalizedTopLeft: $0, in: region.screenFrame)
+        let wordBoxes = OCRSentenceAssembler.segments(forRange: linguisticRange, in: assembled)
+        let wordRect: NSRect?
+        if let first = wordBoxes.first {
+            let union = wordBoxes.dropFirst().reduce(first.box) { $0.union($1.box) }
+            wordRect = OCRGeometry.screenRect(fromNormalizedTopLeft: union, in: region.screenFrame)
+        } else {
+            wordRect = assembled.tappedWordBox.map {
+                OCRGeometry.screenRect(fromNormalizedTopLeft: $0, in: region.screenFrame)
+            }
         }
         let result = Result(
             selection: selection,
             wordRect: wordRect,
-            clickedWordRangeInLookupText: wordRange,
+            clickedWordRangeInLookupText: linguisticRange,
             assembled: assembled,
             screenFrame: region.screenFrame
         )
