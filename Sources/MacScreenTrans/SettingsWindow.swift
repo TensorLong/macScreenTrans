@@ -8,11 +8,12 @@ final class SettingsWindowController {
 
     init(onSelfCheck: @escaping () -> String, onTranslateUnderCursor: @escaping () -> Void) {
         let view = SettingsView(onSelfCheck: onSelfCheck, onTranslateUnderCursor: onTranslateUnderCursor)
-        // Fixed-size settings window per macOS HIG: the grouped Form scrolls
-        // internally, so the chrome never needs to resize or zoom.
+        // Resizable: on small displays or with enlarged system text the
+        // grouped Form overflows one screen, so users must be able to grow
+        // and shrink the window. The Form scrolls internally at any size.
         window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 680, height: 760),
-            styleMask: [.titled, .closable, .miniaturizable],
+            styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
         )
@@ -85,7 +86,8 @@ private struct SettingsView: View {
             Divider()
             footerBar
         }
-        .frame(width: 680, height: 760)
+        .frame(minWidth: 560, idealWidth: 680, maxWidth: .infinity,
+               minHeight: 420, idealHeight: 760, maxHeight: .infinity)
         .onAppear(perform: refreshStatuses)
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             refreshStatuses()
