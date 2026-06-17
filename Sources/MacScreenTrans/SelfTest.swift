@@ -375,6 +375,12 @@ private final class SelfTestDelegate: NSObject, NSApplicationDelegate {
         try? await Task.sleep(nanoseconds: 300_000_000)
 
         var failures = 0
+        if popup.isDismissShieldVisible {
+            print("✓ dismiss shield shown under popup")
+        } else {
+            print("✗ dismiss shield missing — a dismissing click would fall through to a link")
+            failures += 1
+        }
         let frame = popup.panelFrame
         popup.simulateScroll(at: NSPoint(x: frame.minX - 40, y: frame.minY - 40))
         if notified == 1 {
@@ -399,6 +405,12 @@ private final class SelfTestDelegate: NSObject, NSApplicationDelegate {
             failures += 1
         }
         popup.close()
+        if popup.isDismissShieldVisible {
+            print("✗ dismiss shield still visible after close")
+            failures += 1
+        } else {
+            print("✓ dismiss shield hidden after close")
+        }
         print()
         return failures
     }

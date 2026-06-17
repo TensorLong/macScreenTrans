@@ -42,6 +42,12 @@ final class FloatingTranslationWindowController {
     nonisolated(unsafe) private var globalKeyMonitor: Any?
     nonisolated(unsafe) private var globalMouseMonitor: Any?
     nonisolated(unsafe) private var globalScrollMonitor: Any?
+    /// Transparent full-screen catcher shown UNDER the popup while it is
+    /// visible. It swallows the click or scroll that dismisses the popup so
+    /// that event can't fall through to a hyperlink in the app underneath —
+    /// it is delivered to this window, never to the app below. The popup
+    /// panel sits one level above, so clicks ON the popup reach the popup.
+    private let dismissShield = DismissShieldPanel()
 
     /// Frozen at `show(anchoredTo:)`. The edge of the panel adjacent to the
     /// word is pinned at `pinnedScreenY` in screen coordinates; subsequent
@@ -189,6 +195,10 @@ final class FloatingTranslationWindowController {
             tailHeight: Self.tailHeight
         )
 
+        dismissShield.onDismiss = { [weak self] in
+            self?.dismissFromShield()
+        }
+
         installDismissMonitors()
     }
 
@@ -213,6 +223,7 @@ final class FloatingTranslationWindowController {
     /// so the harness calls the shared handler directly.
     var panelFrame: NSRect { panel.frame }
     var isPanelVisible: Bool { panel.isVisible }
+    var isDismissShieldVisible: Bool { dismissShield.isVisible }
     func simulateScroll(at location: NSPoint) {
         notifyScrollAway(at: location)
     }
@@ -228,6 +239,7 @@ final class FloatingTranslationWindowController {
         let origin = origin(near: point, size: size)
         panel.setFrame(NSRect(origin: origin, size: size), display: true)
         panel.orderFrontRegardless()
+        presentDismissShield()
         dismissArmedAt = Date().addingTimeInterval(0.25)
     }
 
@@ -315,6 +327,7 @@ final class FloatingTranslationWindowController {
         sentenceSectionText = nil
         update(text)
         panel.orderFrontRegardless()
+        presentDismissShield()
         dismissArmedAt = Date().addingTimeInterval(0.25)
     }
 
@@ -397,8 +410,28 @@ final class FloatingTranslationWindowController {
     func close() {
         guard panel.isVisible else { return }
         anchorState = nil
+        dismissShield.orderOut(nil)
         panel.orderOut(nil)
         onCloseHandler?()
+    }
+
+    /// Dismiss requested by a click or scroll on the shield (outside the
+    /// popup). Respect the same arming delay as the spawn gesture; an early
+    /// event is still swallowed by the shield — so it can't reach the app
+    /// below — but leaves the popup up.
+    private func dismissFromShield() {
+        guard Date() >= dismissArmedAt else { return }
+        close()
+    }
+
+    /// Span the shield across every display and order it just under the
+    /// popup. Idempotent — safe to call on each show().
+    private func presentDismissShield() {
+        let union = NSScreen.screens.reduce(NSRect.zero) { $0.union($1.frame) }
+        if !union.isEmpty {
+            dismissShield.setFrame(union, display: false)
+        }
+        dismissShield.orderFrontRegardless()
     }
 
     private func makeHeader() -> NSView {
@@ -596,6 +629,69 @@ final class FloatingTranslationWindowController {
         if let globalScrollMonitor {
             NSEvent.removeMonitor(globalScrollMonitor)
         }
+    }
+}
+
+/// Transparent, non-activating panel spanning all displays, shown one window
+/// level below the popup while it is up. It receives every click or scroll
+/// OUTSIDE the popup's frame and consumes it (the overrides never forward),
+/// so a dismissing click can't reach — and so can't navigate — a hyperlink
+/// in the app underneath. Clicks ON the popup land on the higher popup
+/// window and never reach this shield.
+private final class DismissShieldPanel: NSPanel {
+    var onDismiss: (() -> Void)?
+
+    init() {
+        super.init(
+            contentRect: .zero,
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        isOpaque = false
+        backgroundColor = .clear
+        hasShadow = false
+        ignoresMouseEvents = false
+        hidesOnDeactivate = false
+        animationBehavior = .none
+        // One level below the popup (.popUpMenu) so the popup always wins the
+        // z-order for clicks on itself, while the shield still sits above the
+        // ordinary windows of every other app.
+        level = NSWindow.Level(rawValue: NSWindow.Level.popUpMenu.rawValue - 1)
+        collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle]
+        let catcher = DismissShieldView()
+        catcher.owner = self
+        contentView = catcher
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("DismissShieldPanel is not decodable")
+    }
+
+    override var canBecomeKey: Bool { false }
+    override var canBecomeMain: Bool { false }
+
+    func fireDismiss() {
+        onDismiss?()
+    }
+}
+
+/// Content view of the shield. Overriding the mouse/scroll handlers (and
+/// accepting the first mouse) guarantees the events are consumed here rather
+/// than activating the app or passing through.
+private final class DismissShieldView: NSView {
+    weak var owner: DismissShieldPanel?
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    override func mouseDown(with event: NSEvent) { owner?.fireDismiss() }
+    override func rightMouseDown(with event: NSEvent) { owner?.fireDismiss() }
+    override func otherMouseDown(with event: NSEvent) { owner?.fireDismiss() }
+    override func scrollWheel(with event: NSEvent) {
+        // B-mode: a scroll outside the popup dismisses it. A covering window
+        // can't pass scroll through to the app below without consuming it, so
+        // scroll is treated as a dismiss rather than silently eaten.
+        guard abs(event.scrollingDeltaX) + abs(event.scrollingDeltaY) > 0 else { return }
+        owner?.fireDismiss()
     }
 }
 
