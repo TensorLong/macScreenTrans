@@ -787,6 +787,70 @@ import CMultitouchSupport
     #expect(count == 0)
 }
 
+@Test func threeFingerTapDetectorRejectsTwoFingerTapThenSwipeOverlap() {
+    // Field repro: a two-finger click followed immediately by a two-finger
+    // swipe can overlap at the hardware frame level. One old firm touch plus
+    // two new firm touches creates a brief 3-count peak, then the swipe
+    // continues as two fingers. The detector must not treat the brief peak as
+    // a stationary three-finger tap.
+    var count = 0
+    var detector = ThreeFingerTapDetector { count += 1 }
+
+    detector.process(contactCount: 2, timestamp: 10.00, centroidX: 0.50, centroidY: 0.50)
+    detector.process(contactCount: 3, timestamp: 10.06, centroidX: 0.50, centroidY: 0.50)
+    detector.process(contactCount: 2, timestamp: 10.10, centroidX: 0.60, centroidY: 0.50)
+    detector.process(contactCount: 2, timestamp: 10.16, centroidX: 0.68, centroidY: 0.50)
+    detector.process(contactCount: 0, timestamp: 10.20, centroidX: 0.68, centroidY: 0.50)
+
+    #expect(count == 0)
+}
+
+@Test func threeFingerTapDetectorRejectsFastTwoFingerSwipeTailAfterTransientThree() {
+    // Same overlap as above, but the two-finger swipe tail releases quickly.
+    // The release window alone would pass; tail drift must still reject it.
+    var count = 0
+    var detector = ThreeFingerTapDetector { count += 1 }
+
+    detector.process(contactCount: 2, timestamp: 10.00, centroidX: 0.50, centroidY: 0.50)
+    detector.process(contactCount: 3, timestamp: 10.06, centroidX: 0.50, centroidY: 0.50)
+    detector.process(contactCount: 2, timestamp: 10.07, centroidX: 0.50, centroidY: 0.50)
+    detector.process(contactCount: 2, timestamp: 10.09, centroidX: 0.62, centroidY: 0.50)
+    detector.process(contactCount: 0, timestamp: 10.11, centroidX: 0.62, centroidY: 0.50)
+
+    #expect(count == 0)
+}
+
+@Test func threeFingerTapDetectorRejectsTwoFingerDoubleClickOverlap() {
+    // Field repro without visible swipe: the first two-finger click is still
+    // releasing when the second click lands. The firm count drops, then rises
+    // back to 3 before a full 0-release, which is not one coherent tap.
+    var count = 0
+    var detector = ThreeFingerTapDetector { count += 1 }
+
+    detector.process(contactCount: 2, timestamp: 10.00, centroidX: 0.50, centroidY: 0.50)
+    detector.process(contactCount: 1, timestamp: 10.06, centroidX: 0.50, centroidY: 0.50)
+    detector.process(contactCount: 3, timestamp: 10.09, centroidX: 0.50, centroidY: 0.50)
+    detector.process(contactCount: 2, timestamp: 10.14, centroidX: 0.50, centroidY: 0.50)
+    detector.process(contactCount: 0, timestamp: 10.18, centroidX: 0.50, centroidY: 0.50)
+
+    #expect(count == 0)
+}
+
+@Test func threeFingerTapDetectorRejectsLongTwoFingerPreludeBeforeTransientThree() {
+    // Duration is measured from the first 3-finger frame for normal staggered
+    // landings, but a long two-finger prelude is already a different gesture.
+    // A brief third firm contact at the end must not reset the clock and fire.
+    var count = 0
+    var detector = ThreeFingerTapDetector { count += 1 }
+
+    detector.process(contactCount: 2, timestamp: 10.00, centroidX: 0.50, centroidY: 0.50)
+    detector.process(contactCount: 2, timestamp: 10.30, centroidX: 0.50, centroidY: 0.50)
+    detector.process(contactCount: 3, timestamp: 10.32, centroidX: 0.50, centroidY: 0.50)
+    detector.process(contactCount: 0, timestamp: 10.39, centroidX: 0.50, centroidY: 0.50)
+
+    #expect(count == 0)
+}
+
 @Test func threeFingerTapDetectorRejectsThreeFingerSwipeByDrift() {
     // System three-finger swipe (Mission Control, desktop switching): the
     // centroid drifts a long way across the trackpad. Drift > 0.08 must reject.
