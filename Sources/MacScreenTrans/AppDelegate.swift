@@ -68,6 +68,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private lazy var highlightOverlay = WordHighlightOverlayController()
     private lazy var phraseOverlay = PhraseHighlightOverlayController()
     private lazy var shortcutMonitor = GlobalShortcutMonitor()
+    /// Debounces the wake re-arm: `didWake` and `screensDidWake` can both
+    /// fire for a single wake, and we only want to rebuild the trackpad
+    /// registration once.
+    private var isReArmingTrackpad = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         AppConfiguration.bootstrapDefaults()
@@ -89,6 +93,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
         trackpadMonitor.start()
+
+        // MultitouchSupport silently invalidates our device handles across a
+        // sleep/wake cycle, leaving the tap monitor deaf until the app is
+        // relaunched. Re-arm it whenever the machine or its displays wake.
+        let workspaceCenter = NSWorkspace.shared.notificationCenter
+        for name in [NSWorkspace.didWakeNotification, NSWorkspace.screensDidWakeNotification] {
+            workspaceCenter.addObserver(
+                self,
+                selector: #selector(handleSystemDidWake),
+                name: name,
+                object: nil
+            )
+        }
 
         shortcutMonitor.start { [weak self] in
             Task { @MainActor in
@@ -112,6 +129,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         sentenceTask?.cancel()
         trackpadMonitor.stop()
         shortcutMonitor.stop()
+        NSWorkspace.shared.notificationCenter.removeObserver(self)
     }
 
     private func configureStatusItem() {
@@ -219,6 +237,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func stopListening() {
         trackpadMonitor.stop()
         rebuildStatusMenu()
+    }
+
+    @objc private func handleSystemDidWake() {
+        // Only re-arm a monitor that is supposed to be running. After a deaf
+        // wake `isRunning` still reads true (the death is silent), so this
+        // passes; if the user manually stopped listening it reads false and
+        // we must not resurrect it against their choice.
+        guard trackpadMonitor.isRunning else { return }
+        // didWake and screensDidWake can both fire for one wake; collapse
+        // them into a single rebuild.
+        guard !isReArmingTrackpad else { return }
+        isReArmingTrackpad = true
+        Task { @MainActor [weak self] in
+            // Give the trackpad a moment to finish re-enumerating before we
+            // rebuild the device list; if it isn't ready yet (restart leaves
+            // isRunning false), try once more a few seconds later.
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
+            guard let self else { return }
+            self.trackpadMonitor.restart()
+            if !self.trackpadMonitor.isRunning {
+                try? await Task.sleep(nanoseconds: 3_000_000_000)
+                self.trackpadMonitor.restart()
+            }
+            self.isReArmingTrackpad = false
+            self.rebuildStatusMenu()
+        }
     }
 
     @objc private func quit() {

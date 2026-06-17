@@ -53,6 +53,17 @@ final class TrackpadTapMonitor: @unchecked Sendable {
         }
     }
 
+    /// Tears the multitouch registration down and stands it back up so we
+    /// get fresh device handles. MultitouchSupport invalidates the
+    /// MTDeviceRef handles we registered when the machine sleeps; after wake
+    /// the OS delivers no frames to the stale handles, so the monitor goes
+    /// deaf while `isRunning` still reads true. Re-registering is the only
+    /// recovery short of relaunching the app.
+    func restart() {
+        stop()
+        start()
+    }
+
     deinit {
         stop()
     }
